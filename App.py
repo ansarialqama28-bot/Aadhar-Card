@@ -11,7 +11,7 @@ app = Flask(__name__)
 CORS(app)
 
 # 👇 YAHA APNE IBB BLANK TEMPLATE KA DIRECT IMAGE LINK DAALO 👇
-TEMPLATE_URL = "https://i.ibb.co/your-image-id/blank_template.jpg"
+TEMPLATE_URL = "https://i.ibb.co/BH688zxP/Whats-App-Image-2026-08-01-at-6-54-00-PM.jpg"
 
 def extract_pdf_data(pdf_bytes, password, want_mobile):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
