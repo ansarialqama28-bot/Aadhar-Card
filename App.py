@@ -8,9 +8,10 @@ import re
 import requests
 
 app = Flask(__name__)
-CORS(app)
+# CORS setup taaki Blogger (ya kisi bhi website) se API connect ho sake
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 👇 YAHA APNE IBB BLANK TEMPLATE KA DIRECT IMAGE LINK DAALO 👇
+# Tumhara diya hua naya template link
 TEMPLATE_URL = "https://i.ibb.co/BH688zxP/Whats-App-Image-2026-08-01-at-6-54-00-PM.jpg"
 
 def extract_pdf_data(pdf_bytes, password, want_mobile):
@@ -53,7 +54,7 @@ def extract_pdf_data(pdf_bytes, password, want_mobile):
         data["vid"] = vid_match.group(0)
         text = text.replace(data["vid"], "")
         
-    # Aadhaar Extract
+    # Aadhaar Extract (Masked & Visible dono pakdega)
     aadhaar_match = re.search(r'(?:[0-9]{4}|[xX*]{4})\s(?:[0-9]{4}|[xX*]{4})\s[0-9]{4}', text)
     if aadhaar_match: data["aadhaar"] = aadhaar_match.group(0)
         
@@ -84,8 +85,12 @@ def extract_pdf_data(pdf_bytes, password, want_mobile):
             
     return data, photo_bytes
 
-@app.route('/generate', methods=['POST'])
+@app.route('/generate', methods=['POST', 'OPTIONS'])
 def generate_card():
+    # Preflight request ko allow karne ke liye
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
     try:
         file = request.files.get('pdf')
         password = request.form.get('password', '')
@@ -180,5 +185,6 @@ def generate_card():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# Agar server normal tarike se chalaya jaye
 if __name__ == '__main__':
     app.run(debug=True)
