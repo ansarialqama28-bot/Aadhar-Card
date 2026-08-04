@@ -14,9 +14,9 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 TEMPLATE_URL = "https://i.ibb.co/BH688zxP/Whats-App-Image-2026-08-01-at-6-54-00-PM.jpg"
 
-# Fonts isi folder (api/) ke andar rakhne honge. __file__ ka use karke
-# absolute path banaya hai taaki Vercel ke serverless environment me bhi
-# sahi jagah se font mile (relative path "times.ttf" wahan kaam nahi karta).
+# Fonts isi folder ke andar rakhne honge. __file__ ka use karke absolute
+# path banaya hai taaki Vercel ke serverless environment me bhi sahi
+# jagah se font mile (sirf "times.ttf" likhne se wahan nahi chalta).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -143,7 +143,7 @@ def generate_card():
         photo_with_border = ImageOps.expand(photo, border=2, fill='black')
         template.paste(photo_with_border, (50, 140))  # X, Y coordinates
 
-        # 3. Load Fonts (must live inside the api/ folder in this repo)
+        # 3. Load Fonts (must live in the same folder as this file)
         try:
             font_eng = ImageFont.truetype(font_path("times.ttf"), 24)
             font_eng_bold = ImageFont.truetype(font_path("timesbd.ttf"), 26)
@@ -206,6 +206,12 @@ def generate_card():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Note: app.run() yahan jaanboojh kar nahi hai. Vercel serverless is file
-# ko import karke seedha `app` (Flask/WSGI object) use karta hai — apna
-# development server chalane ke liye "flask --app api/index run" use karein.
+
+@app.route("/", methods=["GET"])
+def health():
+    return "API is running perfectly! Backend is Connected.", 200
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
