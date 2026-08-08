@@ -16,7 +16,7 @@ CORS(app)
 # NOTE: Ye wahi blank template hai jo aapne upload kiya (red box
 # pehle se usi mein fix hai) — isko kisi image host (ibb.co jaisa)
 # par upload karke uska direct link yahan daal dena.
-FRONT_CARD_TEMPLATE_URL = "PASTE_YOUR_BLANK_TEMPLATE_IMAGE_URL_HERE"
+FRONT_CARD_TEMPLATE_URL = "https://i.ibb.co/BH688zxP/Whats-App-Image-2026-08-01-at-6-54-00-PM.jpg"
 
 TEMPLATE_W, TEMPLATE_H = 1016, 638
 
