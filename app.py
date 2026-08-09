@@ -32,13 +32,13 @@ CONTENT_X1 = 975
 
 # Name/DOB/Gender rows ko thoda upar khiska diya hai taaki neeche
 # "Mobile No" print karne ke liye jagah bach jaye.
-TEXT_COL_TOP = 148
-TEXT_COL_BOTTOM = 300
+TEXT_COL_TOP = 158
+TEXT_COL_BOTTOM = 310
 ROW_GAP_DEFAULT = 20     # jab Hindi naam mil jaye — pehle se thoda zyada gap
 ROW_GAP_NO_HINDI = 28    # jab Hindi naam na mile — gap zyada karke adjust
 
 # Mobile No wali row — sirf tab print hogi jab user "Yes" chune
-MOBILE_ROW = (CONTENT_X0, 306, CONTENT_X1, 352)
+MOBILE_ROW = (CONTENT_X0, 316, CONTENT_X1, 362)
 
 # Aadhaar Number aur VID ab poore CARD ke hisaab se center honge,
 # red-box/content-column ke hisaab se nahi.
