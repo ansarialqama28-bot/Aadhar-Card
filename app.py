@@ -35,7 +35,7 @@ CONTENT_X1 = 975
 # "Mobile No" print karne ke liye jagah bach jaye.
 TEXT_COL_TOP = 148
 TEXT_COL_BOTTOM = 300
-ROW_GAP_DEFAULT = 14     # jab Hindi naam mil jaye — pehle se thoda zyada gap
+ROW_GAP_DEFAULT = 16     # jab Hindi naam mil jaye — pehle se thoda zyada gap
 ROW_GAP_NO_HINDI = 24    # jab Hindi naam na mile — gap zyada karke adjust
 
 # Mobile No wali row — sirf tab print hogi jab user "Yes" chune
@@ -49,7 +49,7 @@ VID_BOX = (0, 536, TEMPLATE_W, 562)
 # Name, DOB, Gender, Mobile No — sabka font size ab ek jaisa (unified)
 NAME_FONT_SIZE = 34
 LABEL_FONT_SIZE = 34
-MOBILE_FONT_SIZE = LABEL_FONT_SIZE   # DOB jitna hi size — same font (en regular)
+MOBILE_FONT_SIZE = 36
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 22
 ISSUED_FONT_SIZE = 20
