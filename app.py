@@ -22,7 +22,6 @@ TEMPLATE_W, TEMPLATE_H = 1016, 638
 
 PHOTO_BOX = (38, 160, 277, 466)   # upar se kheenchkar thoda lamba (top upar shift)
 PHOTO_BORDER_WIDTH = 2
-PHOTO_UPSCALE_TARGET = 1080        # photo ko upscale karke kam se kam itne px (longer side)
 
 # Photo ke bilkul left side wali vertical "Aadhaar No. Issued: DATE" patti
 VERTICAL_TEXT_X0 = 16
@@ -313,8 +312,7 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     # ---------- PHOTO: UPSCALE + UNBLUR + ENHANCE + 2px BORDER ----------
     photo_box = scale_box(PHOTO_BOX)
     pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
-    enhanced_photo = enhance_photo(data["photo"])
-    fitted = cover_fit(enhanced_photo, pw, ph)
+    fitted = cover_fit(data["photo"], pw, ph)
     template.paste(fitted, (photo_box[0], photo_box[1]))
 
     border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
