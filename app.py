@@ -34,7 +34,7 @@ CONTENT_X1 = 975
 # "Mobile No" print karne ke liye jagah bach jaye.
 TEXT_COL_TOP = 158
 TEXT_COL_BOTTOM = 310
-ROW_GAP_DEFAULT = 24     # jab Hindi naam mil jaye — pehle se thoda zyada gap
+ROW_GAP_DEFAULT = 28     # jab Hindi naam mil jaye — pehle se thoda zyada gap
 ROW_GAP_NO_HINDI = 28    # jab Hindi naam na mile — gap zyada karke adjust
 
 # Mobile No wali row — sirf tab print hogi jab user "Yes" chune
