@@ -5,7 +5,7 @@ import requests
 import pdfplumber
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 
 app = Flask(__name__)
 CORS(app)
@@ -16,12 +16,13 @@ CORS(app)
 # NOTE: Ye wahi blank template hai jo aapne upload kiya (red box
 # pehle se usi mein fix hai) — isko kisi image host (ibb.co jaisa)
 # par upload karke uska direct link yahan daal dena.
-FRONT_CARD_TEMPLATE_URL = "https://i.ibb.co/BH688zxP/Whats-App-Image-2026-08-01-at-6-54-00-PM.jpg"
+FRONT_CARD_TEMPLATE_URL = "PASTE_YOUR_BLANK_TEMPLATE_IMAGE_URL_HERE"
 
 TEMPLATE_W, TEMPLATE_H = 1016, 638
 
-PHOTO_BOX = (38, 184, 277, 466)
+PHOTO_BOX = (38, 160, 277, 466)   # upar se kheenchkar thoda lamba (top upar shift)
 PHOTO_BORDER_WIDTH = 2
+PHOTO_BRIGHTNESS = 1.3            # sirf photo ki lighting 30% badhai
 
 # Photo ke bilkul left side wali vertical "Aadhaar No. Issued: DATE" patti
 VERTICAL_TEXT_X0 = 16
@@ -30,18 +31,27 @@ VERTICAL_TEXT_X1 = 46
 CONTENT_X0 = 290
 CONTENT_X1 = 975
 
-TEXT_COL_TOP = 165
-TEXT_COL_BOTTOM = 348
+# Name/DOB/Gender rows ko thoda upar khiska diya hai taaki neeche
+# "Mobile No" print karne ke liye jagah bach jaye.
+TEXT_COL_TOP = 150
+TEXT_COL_BOTTOM = 308
 ROW_GAP_DEFAULT = 8      # jab Hindi naam mil jaye
 ROW_GAP_NO_HINDI = 20    # jab Hindi naam na mile — gap zyada karke adjust
 
-AADHAAR_NUM_BOX = (CONTENT_X0, 485, CONTENT_X1, 533)
-VID_BOX = (CONTENT_X0, 536, CONTENT_X1, 562)
+# Mobile No wali row — sirf tab print hogi jab user "Yes" chune
+MOBILE_ROW = (CONTENT_X0, 318, CONTENT_X1, 358)
 
+# Aadhaar Number aur VID ab poore CARD ke hisaab se center honge,
+# red-box/content-column ke hisaab se nahi.
+AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
+VID_BOX = (0, 536, TEMPLATE_W, 562)
+
+# Name, DOB, Gender — teeno ka font size ab ek jaisa (unified)
 NAME_FONT_SIZE = 34
-LABEL_FONT_SIZE = 26
+LABEL_FONT_SIZE = 34
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 22
+MOBILE_FONT_SIZE = VID_FONT_SIZE   # Aadhaar Number/VID jaisa hi font+size
 ISSUED_FONT_SIZE = 20
 
 # ------------------------------------------------------------
@@ -164,6 +174,9 @@ def extract_front_data(pdf_bytes, password=None):
         m = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", text, re.IGNORECASE)
         gender = m.group(1).upper() if m else "N/A"
 
+        m = re.search(r"Mobile:\s*(\d{10})", text)
+        mobile_number = m.group(1) if m else "N/A"
+
         issued_date = find_issued_date(lines, text)
 
         photo_img = find_face_photo_image(page)
@@ -175,6 +188,7 @@ def extract_front_data(pdf_bytes, password=None):
             "vid": vid,
             "dob": dob,
             "gender": gender,
+            "mobile_number": mobile_number,
             "issued_date": issued_date,
             "photo": photo_img,
         }
@@ -252,7 +266,7 @@ def build_content_rows(has_hindi):
 GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDER": "ट्रांसजेंडर"}
 
 
-def build_front_card_image(pdf_bytes, password=None):
+def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
         raise ValueError("PDF mein se chehre wali photo nahi mil payi")
@@ -269,10 +283,11 @@ def build_front_card_image(pdf_bytes, password=None):
 
     draw = ImageDraw.Draw(template)
 
-    # ---------- PHOTO + 2px BORDER ----------
+    # ---------- PHOTO + 2px BORDER + 30% BRIGHTNESS ----------
     photo_box = scale_box(PHOTO_BOX)
     pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
     fitted = cover_fit(data["photo"], pw, ph)
+    fitted = ImageEnhance.Brightness(fitted).enhance(PHOTO_BRIGHTNESS)
     template.paste(fitted, (photo_box[0], photo_box[1]))
 
     border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
@@ -329,6 +344,16 @@ def build_front_card_image(pdf_bytes, password=None):
         label_font_size
     )
 
+    # ---------- MOBILE NO (sirf tab jab user "Yes" chune) ----------
+    if print_mobile and data["mobile_number"] != "N/A":
+        mobile_box = scale_box(MOBILE_ROW)
+        mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
+        draw_mixed_line(
+            draw, mobile_box,
+            [("Mobile No: ", "en"), (data["mobile_number"], "en")],
+            mobile_font_size
+        )
+
     # ---------- AADHAAR NUMBER + VID ----------
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     draw_centered_text(
@@ -354,11 +379,12 @@ def generate_card():
         return jsonify({"error": "PDF file is required (field name: pdf)"}), 400
 
     password = request.form.get("password", "").strip()
+    print_mobile = request.form.get("print_mobile", "no").strip().lower() == "yes"
     pdf_file = request.files["pdf"]
     pdf_bytes = pdf_file.read()
 
     try:
-        template = build_front_card_image(pdf_bytes, password)
+        template = build_front_card_image(pdf_bytes, password, print_mobile)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
