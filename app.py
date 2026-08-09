@@ -27,7 +27,7 @@ PHOTO_BORDER_WIDTH = 2
 VERTICAL_TEXT_X0 = 16
 VERTICAL_TEXT_X1 = 46
 
-CONTENT_X0 = 290
+CONTENT_X0 = 305   # thoda right shift kiya gaya
 CONTENT_X1 = 975
 
 # Name/DOB/Gender rows ko thoda upar khiska diya hai taaki neeche
@@ -211,32 +211,14 @@ def cover_fit(img, box_w, box_h):
     return resized.crop((left, top, left + box_w, top + box_h))
 
 
-def enhance_photo(img):
+def sharpen_photo(img):
     """
-    PDF se nikli photo aksar chhoti aur thodi blur hoti hai. Isliye
-    brightness badhane ki jagah (jo photo ko kharab/washed-out kar
-    deta tha) ab teen cheezein karte hain:
-      1. Upscale — kam se kam PHOTO_UPSCALE_TARGET px (longer side)
-      2. Unblur — UnsharpMask se dhundhlapan kam karna
-      3. Enhance — contrast, color aur sharpness thoda badhana
-         (brightness bilkul touch nahi karte — wahi normal rahegi)
+    PDF se nikli photo chhoti hone ki wajah se paste karne par blur
+    lag sakti hai. Isliye sirf halka sa UnsharpMask (unblur) laga
+    rahe hain — brightness, contrast, color kuch bhi touch nahi
+    kiya, wo bilkul normal/original hi rahega.
     """
-    w, h = img.size
-    longer_side = max(w, h)
-    if longer_side < PHOTO_UPSCALE_TARGET:
-        scale = PHOTO_UPSCALE_TARGET / longer_side
-        new_w, new_h = int(w * scale), int(h * scale)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-
-    # Unblur
-    img = img.filter(ImageFilter.UnsharpMask(radius=2.2, percent=160, threshold=3))
-
-    # Enhance (brightness ke alawa)
-    img = ImageEnhance.Contrast(img).enhance(1.12)
-    img = ImageEnhance.Color(img).enhance(1.08)
-    img = ImageEnhance.Sharpness(img).enhance(1.35)
-
-    return img
+    return img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
 
 
 def draw_centered_text(draw, box, text, font, fill="#1A2238"):
@@ -254,24 +236,33 @@ def draw_mixed_line(draw, box, segments, font_size, fill="#1A2238"):
     segments: [(text, 'hi'/'en'), ...] — ek hi line mein Hindi aur
     English/number dono ko unke apne-apne font (Devanagari / Times
     New Roman) se, ek ke baad ek jodkar draw karta hai.
+
+    IMPORTANT: Devanagari aur Latin font ki bbox-height alag hoti hai,
+    isliye sirf "top" align karne se Hindi neeche aur English upar
+    dikhta tha. Ab dono BASELINE se align hote hain (jaise real
+    printing mein hota hai) — isse dono ek hi line mein barabar aate hain.
     """
     x0, y0, x1, y1 = box
     box_h = y1 - y0
 
     seg_data = []
-    max_h = 0
+    max_ascent = 0
+    max_descent = 0
     for text, lang in segments:
         font = get_font(lang, False, font_size)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        seg_data.append((text, font, bbox, w))
-        max_h = max(max_h, h)
+        ascent, descent = font.getmetrics()
+        seg_data.append((text, font))
+        max_ascent = max(max_ascent, ascent)
+        max_descent = max(max_descent, descent)
+
+    total_h = max_ascent + max_descent
+    baseline_y = y0 + (box_h - total_h) // 2 + max_ascent
 
     cx = x0
-    for text, font, bbox, w in seg_data:
-        ty = y0 + (box_h - max_h) // 2 - bbox[1]
-        draw.text((cx, ty), text, font=font, fill=fill)
-        cx += w
+    for text, font in seg_data:
+        draw.text((cx, baseline_y), text, font=font, fill=fill, anchor="ls")
+        bbox = draw.textbbox((cx, baseline_y), text, font=font, anchor="ls")
+        cx = bbox[2]
 
 
 def build_content_rows(has_hindi):
@@ -309,10 +300,11 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
 
     draw = ImageDraw.Draw(template)
 
-    # ---------- PHOTO: UPSCALE + UNBLUR + ENHANCE + 2px BORDER ----------
+    # ---------- PHOTO: UNBLUR (sharpen only) + 2px BORDER ----------
     photo_box = scale_box(PHOTO_BOX)
     pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
-    fitted = cover_fit(data["photo"], pw, ph)
+    sharpened = sharpen_photo(data["photo"])
+    fitted = cover_fit(sharpened, pw, ph)
     template.paste(fitted, (photo_box[0], photo_box[1]))
 
     border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
