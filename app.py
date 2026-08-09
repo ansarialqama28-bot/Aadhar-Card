@@ -1,11 +1,10 @@
 import os
 import re
 import io
-import requests
 import pdfplumber
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
 app = Flask(__name__)
 CORS(app)
@@ -13,16 +12,17 @@ CORS(app)
 # ============================================================
 # CONFIG — FRONT CARD (Aadhaar)
 # ============================================================
-# NOTE: Ye wahi blank template hai jo aapne upload kiya (red box
-# pehle se usi mein fix hai) — isko kisi image host (ibb.co jaisa)
-# par upload karke uska direct link yahan daal dena.
-FRONT_CARD_TEMPLATE_URL = "https://i.ibb.co/BH688zxP/Whats-App-Image-2026-08-01-at-6-54-00-PM.jpg"
+# Blank template ab repository me hi rakha hua hai (ImgBB se fetch
+# nahi karna — isse process fast hoga). Ye file app.py ke sath
+# usi folder me honi chahiye.
+TEMPLATE_FILENAME = "aadhar_template_front.jpg"
+TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), TEMPLATE_FILENAME)
 
 TEMPLATE_W, TEMPLATE_H = 1016, 638
 
 PHOTO_BOX = (38, 160, 277, 466)   # upar se kheenchkar thoda lamba (top upar shift)
 PHOTO_BORDER_WIDTH = 2
-PHOTO_BRIGHTNESS = 1.3            # sirf photo ki lighting 30% badhai
+PHOTO_UPSCALE_TARGET = 1080        # photo ko upscale karke kam se kam itne px (longer side)
 
 # Photo ke bilkul left side wali vertical "Aadhaar No. Issued: DATE" patti
 VERTICAL_TEXT_X0 = 16
@@ -33,25 +33,25 @@ CONTENT_X1 = 975
 
 # Name/DOB/Gender rows ko thoda upar khiska diya hai taaki neeche
 # "Mobile No" print karne ke liye jagah bach jaye.
-TEXT_COL_TOP = 150
-TEXT_COL_BOTTOM = 308
-ROW_GAP_DEFAULT = 8      # jab Hindi naam mil jaye
-ROW_GAP_NO_HINDI = 20    # jab Hindi naam na mile — gap zyada karke adjust
+TEXT_COL_TOP = 148
+TEXT_COL_BOTTOM = 300
+ROW_GAP_DEFAULT = 14     # jab Hindi naam mil jaye — pehle se thoda zyada gap
+ROW_GAP_NO_HINDI = 24    # jab Hindi naam na mile — gap zyada karke adjust
 
 # Mobile No wali row — sirf tab print hogi jab user "Yes" chune
-MOBILE_ROW = (CONTENT_X0, 318, CONTENT_X1, 358)
+MOBILE_ROW = (CONTENT_X0, 306, CONTENT_X1, 352)
 
 # Aadhaar Number aur VID ab poore CARD ke hisaab se center honge,
 # red-box/content-column ke hisaab se nahi.
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
 
-# Name, DOB, Gender — teeno ka font size ab ek jaisa (unified)
+# Name, DOB, Gender, Mobile No — sabka font size ab ek jaisa (unified)
 NAME_FONT_SIZE = 34
 LABEL_FONT_SIZE = 34
+MOBILE_FONT_SIZE = LABEL_FONT_SIZE   # DOB jitna hi size — same font (en regular)
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 22
-MOBILE_FONT_SIZE = VID_FONT_SIZE   # Aadhaar Number/VID jaisa hi font+size
 ISSUED_FONT_SIZE = 20
 
 # ------------------------------------------------------------
@@ -212,6 +212,34 @@ def cover_fit(img, box_w, box_h):
     return resized.crop((left, top, left + box_w, top + box_h))
 
 
+def enhance_photo(img):
+    """
+    PDF se nikli photo aksar chhoti aur thodi blur hoti hai. Isliye
+    brightness badhane ki jagah (jo photo ko kharab/washed-out kar
+    deta tha) ab teen cheezein karte hain:
+      1. Upscale — kam se kam PHOTO_UPSCALE_TARGET px (longer side)
+      2. Unblur — UnsharpMask se dhundhlapan kam karna
+      3. Enhance — contrast, color aur sharpness thoda badhana
+         (brightness bilkul touch nahi karte — wahi normal rahegi)
+    """
+    w, h = img.size
+    longer_side = max(w, h)
+    if longer_side < PHOTO_UPSCALE_TARGET:
+        scale = PHOTO_UPSCALE_TARGET / longer_side
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Unblur
+    img = img.filter(ImageFilter.UnsharpMask(radius=2.2, percent=160, threshold=3))
+
+    # Enhance (brightness ke alawa)
+    img = ImageEnhance.Contrast(img).enhance(1.12)
+    img = ImageEnhance.Color(img).enhance(1.08)
+    img = ImageEnhance.Sharpness(img).enhance(1.35)
+
+    return img
+
+
 def draw_centered_text(draw, box, text, font, fill="#1A2238"):
     x0, y0, x1, y1 = box
     bw, bh = x1 - x0, y1 - y0
@@ -271,8 +299,7 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     if data["photo"] is None:
         raise ValueError("PDF mein se chehre wali photo nahi mil payi")
 
-    resp = requests.get(FRONT_CARD_TEMPLATE_URL, timeout=15)
-    template = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    template = Image.open(TEMPLATE_PATH).convert("RGB")
 
     scale_x = template.width / TEMPLATE_W
     scale_y = template.height / TEMPLATE_H
@@ -283,11 +310,11 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
 
     draw = ImageDraw.Draw(template)
 
-    # ---------- PHOTO + 2px BORDER + 30% BRIGHTNESS ----------
+    # ---------- PHOTO: UPSCALE + UNBLUR + ENHANCE + 2px BORDER ----------
     photo_box = scale_box(PHOTO_BOX)
     pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
-    fitted = cover_fit(data["photo"], pw, ph)
-    fitted = ImageEnhance.Brightness(fitted).enhance(PHOTO_BRIGHTNESS)
+    enhanced_photo = enhance_photo(data["photo"])
+    fitted = cover_fit(enhanced_photo, pw, ph)
     template.paste(fitted, (photo_box[0], photo_box[1]))
 
     border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
