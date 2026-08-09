@@ -34,8 +34,8 @@ CONTENT_X1 = 975
 # "Mobile No" print karne ke liye jagah bach jaye.
 TEXT_COL_TOP = 158
 TEXT_COL_BOTTOM = 310
-ROW_GAP_DEFAULT = 28     # jab Hindi naam mil jaye — pehle se thoda zyada gap
-ROW_GAP_NO_HINDI = 28    # jab Hindi naam na mile — gap zyada karke adjust
+ROW_GAP_DEFAULT = 34     # Hindi mile ya na mile — gap hamesha same rahega
+ROW_GAP_NO_HINDI = 34
 
 # Mobile No wali row — sirf tab print hogi jab user "Yes" chune
 MOBILE_ROW = (CONTENT_X0, 316, CONTENT_X1, 362)
@@ -211,16 +211,6 @@ def cover_fit(img, box_w, box_h):
     return resized.crop((left, top, left + box_w, top + box_h))
 
 
-def sharpen_photo(img):
-    """
-    PDF se nikli photo chhoti hone ki wajah se paste karne par blur
-    lag sakti hai. Isliye sirf halka sa UnsharpMask (unblur) laga
-    rahe hain — brightness, contrast, color kuch bhi touch nahi
-    kiya, wo bilkul normal/original hi rahega.
-    """
-    return img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
-
-
 def draw_centered_text(draw, box, text, font, fill="#1A2238"):
     x0, y0, x1, y1 = box
     bw, bh = x1 - x0, y1 - y0
@@ -237,10 +227,8 @@ def draw_mixed_line(draw, box, segments, font_size, fill="#1A2238"):
     English/number dono ko unke apne-apne font (Devanagari / Times
     New Roman) se, ek ke baad ek jodkar draw karta hai.
 
-    IMPORTANT: Devanagari aur Latin font ki bbox-height alag hoti hai,
-    isliye sirf "top" align karne se Hindi neeche aur English upar
-    dikhta tha. Ab dono BASELINE se align hote hain (jaise real
-    printing mein hota hai) — isse dono ek hi line mein barabar aate hain.
+    Dono BASELINE se align hote hain (jaise real printing mein
+    hota hai) — isse dono ek hi line mein barabar aate hain.
     """
     x0, y0, x1, y1 = box
     box_h = y1 - y0
@@ -300,11 +288,10 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
 
     draw = ImageDraw.Draw(template)
 
-    # ---------- PHOTO: UNBLUR (sharpen only) + 2px BORDER ----------
+    # ---------- PHOTO: RAW (koi processing/filter nahi) + 2px BORDER ----------
     photo_box = scale_box(PHOTO_BOX)
     pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
-    sharpened = sharpen_photo(data["photo"])
-    fitted = cover_fit(sharpened, pw, ph)
+    fitted = cover_fit(data["photo"], pw, ph)
     template.paste(fitted, (photo_box[0], photo_box[1]))
 
     border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
