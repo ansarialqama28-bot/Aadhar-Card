@@ -2,5 +2,5 @@ flask
 flask-cors
 pdfplumber
 pillow
-requests
+pypdfium2
 gunicorn
