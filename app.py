@@ -2,6 +2,7 @@ import os
 import re
 import io
 import pdfplumber
+import pypdfium2 as pdfium
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
@@ -28,17 +29,13 @@ CONTENT_X1 = 975
 
 TEXT_COL_TOP = 158
 
-# Har row ke beech ka gap ab ALAG-ALAG control hota hai (pehle sab
-# rows ek hi ROW_GAP use karte the). Abhi sabki value same (34) rakhi
-# hai jaisa pehle tha — ab tum inhe ek-ek karke independently badal
-# sakte ho.
-NAME_ROW_HEIGHT = 20          # Hindi Name aur English Name row ki height
-LABEL_ROW_HEIGHT = 20         # DOB / Gender / Mobile row ki height
+NAME_ROW_HEIGHT = 20
+LABEL_ROW_HEIGHT = 20
 
-GAP_HINDI_NAME_TO_ENGLISH_NAME = 34   # Hindi Name -> English Name
-GAP_ENGLISH_NAME_TO_DOB = 34          # English Name -> DOB
-GAP_DOB_TO_GENDER = 34                # DOB -> Gender
-GAP_GENDER_TO_MOBILE = 34             # Gender -> Mobile No
+GAP_HINDI_NAME_TO_ENGLISH_NAME = 14
+GAP_ENGLISH_NAME_TO_DOB = 14
+GAP_DOB_TO_GENDER = 14
+GAP_GENDER_TO_MOBILE = 14
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
@@ -50,57 +47,57 @@ AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 22
 ISSUED_FONT_SIZE = 20
 
-# Front photo ki brightness kitni badhani hai (1.3 = 30% zyada)
 PHOTO_BRIGHTNESS = 1.3
 
 # ============================================================
 # CONFIG — BACK CARD (Aadhaar)
 # ============================================================
-# Back ka blank template bhi repo mein isi tarah rakhna hai (app.py ke
-# saath, usi folder mein) — filename yahan se badal sakte ho.
 BACK_TEMPLATE_FILENAME = "aadhar_template_back.jpg"
 BACK_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACK_TEMPLATE_FILENAME)
 
-# Agar back template ka actual pixel size front se alag hai, to yahan
-# badal dena — scale khud-ba-khud sambhal lega, coordinates proportion
-# mein rahenge.
 BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
-
-# QR back template mein pehle se fixed/printed hai, isliye yahan draw
-# nahi karna — sirf text fields likhne hain.
 
 BACK_VERTICAL_TEXT_X0 = 16
 BACK_VERTICAL_TEXT_X1 = 46
 
-# Content column QR (jo roughly x:690-985, y:172-460 par hai) se pehle
-# tak hi rakha hai, taaki kabhi overlap na ho.
 BACK_CONTENT_X0 = 55
 BACK_CONTENT_X1 = 670
 
 HINDI_LABEL_BOX   = (BACK_CONTENT_X0, 178, BACK_CONTENT_X1, 206)
-HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 208, BACK_CONTENT_X1, 307)   # ~3 lines tak jagah
+HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 208, BACK_CONTENT_X1, 307)
 
-ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 321, BACK_CONTENT_X1, 349)  # Hindi block se 14px gap
-ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 351, BACK_CONTENT_X1, 450)  # ~3 lines, Aadhaar box (485) se 35px gap
-
-# Aadhaar Number aur VID — FRONT wale AADHAAR_NUM_BOX / VID_BOX / font
-# size hi reuse kar rahe hain, jaisa maanga gaya tha (bilkul same
-# size/font/jagah, taaki dono card consistent dikhein). Ye QR (jo y:460
-# tak hai) ke neeche (y:485 se) shuru hote hain, isliye QR se bhi clear hai.
+ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 321, BACK_CONTENT_X1, 349)
+ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 351, BACK_CONTENT_X1, 450)
 
 BACK_LABEL_FONT_SIZE = 26
 BACK_ADDRESS_FONT_SIZE = 24
 BACK_ADDRESS_LINE_GAP = 6
 
-# ------------------------------------------------------------
-# FONTS
-# ------------------------------------------------------------
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
 FONT_HI_REGULAR = "NotoSansDevanagari-Regular.ttf"
 FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
 
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
+
+
+def fix_devanagari_spacing(text):
+    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])\s+", r"\1", text)
+
+
+def extract_text_pdfium(pdf_bytes, password=None):
+    pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes), password=password or None)
+    try:
+        page = pdf[0]
+        textpage = page.get_textpage()
+        raw_text = textpage.get_text_range()
+    finally:
+        pdf.close()
+
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    text = fix_devanagari_spacing(text)
+    return text
 
 
 def get_font(lang, bold, size):
@@ -117,9 +114,6 @@ def get_font(lang, bold, size):
             return ImageFont.load_default()
 
 
-# ============================================================
-# PDF SE DATA NIKALNA — FRONT
-# ============================================================
 def find_face_photo_image(page):
     candidates = []
     for im in page.images:
@@ -210,186 +204,133 @@ def extract_front_data(pdf_bytes, password=None):
         }
 
 
-# ============================================================
-# PDF SE DATA NIKALNA — BACK
-# ============================================================
 def find_details_as_on_date(lines, full_text):
-    """
-    Back ki "Details As On: DATE" wali vertical patti bhi PDF mein
-    90-degree ghumi hoti hai, isliye text ULTA (reversed) nikalta hai —
-    front ki "Aadhaar No. Issued" patti jaisa hi. Marker "sliateD"
-    ("Details" ulta) dhoondh kar, uske thodi lines upar ulti date
-    dhoondte hain.
-    """
-    for i, line in enumerate(lines):
-        cleaned = re.sub(r"[^a-z]", "", line.strip().lower())
-        if cleaned == "sliated":
-            for k in range(max(0, i - 5), i):
-                candidate = lines[k].strip()
-                rev = candidate[::-1]
-                if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", rev):
-                    return rev
-
-    matches = re.findall(r"\b(\d{4}/\d{2}/\d{1,2})\b", full_text)
-    if len(matches) >= 2:
-        return matches[1][::-1]
-    elif matches:
-        return matches[0][::-1]
+    m = re.search(r"Details\s+as\s+on\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, re.IGNORECASE)
+    if m:
+        return m.group(1)
     return "N/A"
 
 
 def extract_back_data(pdf_bytes, password=None):
-    with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
-        page = pdf.pages[0]
-        text = page.extract_text() or ""
-        lines = text.split("\n")
+    text = extract_text_pdfium(pdf_bytes, password)
+    lines = text.split("\n")
 
-        # --- Aadhaar number & VID: front jaisa hi (pehla match) ---
-        m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
-        aadhaar_number = m.group(1) if m else "N/A"
+    m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
+    aadhaar_number = m.group(1) if m else "N/A"
 
-        m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
-        vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
+    m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
+    vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
 
-        # --- English name: sirf Hindi address ke beech se front-column
-        # ka "naam" tukda saaf karne ke liye chahiye ---
-        english_name = "N/A"
-        for i, line in enumerate(lines):
-            if line.strip() == "To":
-                if i + 2 < len(lines):
-                    english_name = lines[i + 2].strip()
-                break
+    english_name = "N/A"
+    for i, line in enumerate(lines):
+        if line.strip() == "To":
+            if i + 2 < len(lines):
+                english_name = lines[i + 2].strip()
+            break
 
-        # --- English address: back ke "Address:" paragraph ko seedha PDF
-        # se nikalna reliable nahi hai (front column ke text ke saath
-        # bahut zyada interleave/garbled ho jaata hai). Isliye UIDAI ke
-        # FIXED back-address format se, front ke saaf structured fields
-        # (S/O, Village, Post, VTC, PO, District, State, PIN) jodkar khud
-        # banate hain: "S/O: X, Village- Y, Post- Z, VTC, PO: A, DIST: B,
-        # State - PIN" — ye bilkul waisa hi banta hai jaisa asli card par
-        # chhapa hota hai.
-        def field(pattern):
-            fm = re.search(pattern, text)
-            return fm.group(1).strip().rstrip(",") if fm else ""
+    def field(pattern):
+        fm = re.search(pattern, text)
+        return fm.group(1).strip().rstrip(",") if fm else ""
 
-        guardian = field(r"S/O:\s*([^\n,]+)")
-        village = field(r"Village-\s*([^\n,]+)")
-        post = field(r"Post-\s*([^\n,]+)")
-        vtc = field(r"VTC:\s*([^\n,]+)")
-        po = field(r"PO:\s*([^\n,]+)")
-        district = field(r"(?<!Sub )District:\s*([^\n,]+)")
-        state = field(r"State:\s*([^\n,]+)")
-        pincode = field(r"PIN Code:\s*(\d+)")
+    guardian = field(r"S/O:\s*([^\n,]+)")
+    village = field(r"Village-\s*([^\n,]+)")
+    post = field(r"Post-\s*([^\n,]+)")
+    vtc = field(r"VTC:\s*([^\n,]+)")
+    po = field(r"PO:\s*([^\n,]+)")
+    district = field(r"(?<!Sub )District:\s*([^\n,]+)")
+    state = field(r"State:\s*([^\n,]+)")
+    pincode = field(r"PIN Code:\s*(\d+)")
 
-        english_parts = []
-        if guardian: english_parts.append(f"S/O: {guardian}")
-        if village: english_parts.append(f"Village- {village}")
-        if post: english_parts.append(f"Post- {post}")
-        if vtc: english_parts.append(vtc)
-        if po: english_parts.append(f"PO: {po}")
-        if district: english_parts.append(f"DIST: {district}")
-        english_address = ", ".join(english_parts)
-        tail = ", ".join(x for x in [state, pincode] if x)
-        if tail:
-            english_address = f"{english_address}, {state} - {pincode}" if (state and pincode) else f"{english_address}, {tail}"
-        if not english_address:
-            english_address = "N/A"
+    english_parts = []
+    if guardian: english_parts.append(f"S/O: {guardian}")
+    if village: english_parts.append(f"Village- {village}")
+    if post: english_parts.append(f"Post- {post}")
+    if vtc: english_parts.append(vtc)
+    if po: english_parts.append(f"PO: {po}")
+    if district: english_parts.append(f"DIST: {district}")
+    english_address = ", ".join(english_parts)
+    tail = ", ".join(x for x in [state, pincode] if x)
+    if tail:
+        english_address = f"{english_address}, {state} - {pincode}" if (state and pincode) else f"{english_address}, {tail}"
+    if not english_address:
+        english_address = "N/A"
 
-        # --- Hindi address: poore PDF text mein jahan bhi Devanagari
-        # address wala block mile (sirf "पता" label ke baad hi nahi,
-        # "आत्मज" jaisa guardian-marker milne par bhi try karte hain),
-        # wahan se "- PIN" wali last line tak collect karte hain. Beech
-        # mein aa gaye front-column ke English tukdo (naam, DOB) ko
-        # surgically hata dete hain.
-        def clean_address_line(raw_line):
-            cleaned = raw_line
-            if english_name and english_name != "N/A":
-                cleaned = cleaned.replace(english_name, " ")
-            cleaned = re.sub(r"जन्म.*?DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
-            cleaned = re.sub(r"/?\s*DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
-            cleaned = cleaned.replace("\x00", "")
-            return re.sub(r"\s+", " ", cleaned).strip()
+    def clean_address_line(raw_line):
+        cleaned = raw_line
+        if english_name and english_name != "N/A":
+            cleaned = cleaned.replace(english_name, " ")
+        cleaned = re.sub(r"जन्म.*?DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
+        cleaned = re.sub(r"/?\s*DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip()
 
-        def collect_hindi_block(start_idx, label_pattern=None):
-            collected = []
-            first_line = lines[start_idx]
-            if label_pattern:
-                parts = re.split(label_pattern, first_line, maxsplit=1)
-                remainder = parts[1].strip() if len(parts) > 1 else ""
-            else:
-                remainder = first_line.strip()
+    def collect_hindi_block(start_idx, label_pattern=None):
+        collected = []
+        first_line = lines[start_idx]
+        if label_pattern:
+            parts = re.split(label_pattern, first_line, maxsplit=1)
+            remainder = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            remainder = first_line.strip()
 
-            remainder = clean_address_line(remainder)
-            if remainder and DEVANAGARI_RE.search(remainder):
-                collected.append(remainder)
+        remainder = clean_address_line(remainder)
+        if remainder and DEVANAGARI_RE.search(remainder):
+            collected.append(remainder)
 
-            if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", first_line):
-                return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
-
-            for j in range(start_idx + 1, min(start_idx + 8, len(lines))):
-                raw_line = lines[j]
-                cleaned = clean_address_line(raw_line)
-                if cleaned and DEVANAGARI_RE.search(cleaned):
-                    collected.append(cleaned)
-                if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", raw_line):
-                    break
-
+        if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", first_line):
             return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
 
-        hindi_address = None
+        for j in range(start_idx + 1, min(start_idx + 8, len(lines))):
+            raw_line = lines[j]
+            cleaned = clean_address_line(raw_line)
+            if cleaned and DEVANAGARI_RE.search(cleaned):
+                collected.append(cleaned)
+            if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", raw_line):
+                break
 
-        # Try 1: "पता" label ke baad se
+        return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
+
+    hindi_address = None
+
+    for i, line in enumerate(lines):
+        if "पता" in line:
+            candidate = collect_hindi_block(i, label_pattern=r"पता\s*:?")
+            if candidate:
+                hindi_address = candidate
+            break
+
+    if not hindi_address:
         for i, line in enumerate(lines):
-            if "पता" in line:
-                candidate = collect_hindi_block(i, label_pattern=r"पता\s*:?")
+            if "आत्मज" in line:
+                candidate = collect_hindi_block(i)
                 if candidate:
                     hindi_address = candidate
                 break
 
-        # Try 2: agar upar se nahi mila, "आत्मज" (guardian marker) ke
-        # aas-paas se dhoondo — PDF ke kisi bhi hisse mein ho sakta hai
-        if not hindi_address:
-            for i, line in enumerate(lines):
-                if "आत्मज" in line:
-                    candidate = collect_hindi_block(i)
-                    if candidate:
-                        hindi_address = candidate
-                    break
+    if not hindi_address:
+        for i, line in enumerate(lines):
+            if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", line):
+                candidate = collect_hindi_block(max(0, i - 2))
+                if candidate:
+                    hindi_address = candidate
+                break
 
-        # Try 3: last resort — poore text mein jahan bhi Devanagari +
-        # "- 6 digit PIN" wali line mile, wahi se peeche ki 1-2 Devanagari
-        # lines bhi jod kar address bana lo
-        if not hindi_address:
-            for i, line in enumerate(lines):
-                if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", line):
-                    window_start = max(0, i - 2)
-                    candidate = collect_hindi_block(window_start)
-                    if candidate:
-                        hindi_address = candidate
-                    break
+    if hindi_address:
+        english_address_final = english_address
+    else:
+        hindi_address = english_address if english_address != "N/A" else "N/A"
+        english_address_final = ""
 
-        # Fallback: Hindi address kahi bhi nahi mila to Hindi ki jagah
-        # English address dikha do, aur English wali jagah khaali chhod do.
-        if hindi_address:
-            english_address_final = english_address
-        else:
-            hindi_address = english_address if english_address != "N/A" else "N/A"
-            english_address_final = ""
+    details_as_on = find_details_as_on_date(lines, text)
 
-        details_as_on = find_details_as_on_date(lines, text)
-
-        return {
-            "hindi_address": hindi_address,
-            "english_address": english_address_final,
-            "aadhaar_number": aadhaar_number,
-            "vid": vid,
-            "details_as_on": details_as_on,
-        }
+    return {
+        "hindi_address": hindi_address,
+        "english_address": english_address_final,
+        "aadhaar_number": aadhaar_number,
+        "vid": vid,
+        "details_as_on": details_as_on,
+    }
 
 
-# ============================================================
-# IMAGE HELPERS
-# ============================================================
 def cover_fit(img, box_w, box_h):
     img_ratio = img.width / img.height
     box_ratio = box_w / box_h
@@ -440,10 +381,6 @@ def draw_mixed_line(draw, box, segments, font_size, fill="#1A2238"):
 
 
 def draw_wrapped_text(draw, box, text, font, line_gap=6, fill="#1A2238"):
-    """
-    Diye gaye box ki width mein text ko word-wrap karke, kai lines mein
-    left-aligned draw karta hai (Hindi/English address paragraphs ke liye).
-    """
     x0, y0, x1, y1 = box
     max_width = x1 - x0
 
@@ -472,12 +409,6 @@ def draw_wrapped_text(draw, box, text, font, line_gap=6, fill="#1A2238"):
 
 
 def build_content_rows(has_hindi):
-    """
-    Rows ko upar se neeche stack karta hai, har pair ke beech apna
-    ALAG gap use karke (GAP_HINDI_NAME_TO_ENGLISH_NAME, waghera).
-    Return: (rows list, gender row ke neeche wala cursor — isi se
-    Mobile row ki position GAP_GENDER_TO_MOBILE jodkar nikalti hai).
-    """
     rows = []
     cursor = TEXT_COL_TOP
 
@@ -500,9 +431,6 @@ def build_content_rows(has_hindi):
 GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDER": "ट्रांसजेंडर"}
 
 
-# ============================================================
-# FRONT CARD BUILD
-# ============================================================
 def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
@@ -604,9 +532,6 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     return template
 
 
-# ============================================================
-# BACK CARD BUILD
-# ============================================================
 def build_back_card_image(pdf_bytes, password=None):
     data = extract_back_data(pdf_bytes, password)
 
@@ -621,7 +546,6 @@ def build_back_card_image(pdf_bytes, password=None):
 
     draw = ImageDraw.Draw(template)
 
-    # ---------- VERTICAL "Details As On: DATE" (front ki patti jaisi hi) ----------
     details_text = f"Details As On: {data['details_as_on']}"
     vfont = get_font("en", False, int(ISSUED_FONT_SIZE * scale_y))
 
@@ -639,7 +563,6 @@ def build_back_card_image(pdf_bytes, password=None):
     vy = (template.height - rotated.height) // 2
     template.paste(rotated, (vx, vy), rotated)
 
-    # ---------- HINDI ADDRESS ----------
     hindi_label_box = scale_box(HINDI_LABEL_BOX)
     hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
     label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
@@ -652,7 +575,6 @@ def build_back_card_image(pdf_bytes, password=None):
         line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
     )
 
-    # ---------- ENGLISH ADDRESS ----------
     english_label_box = scale_box(ENGLISH_LABEL_BOX)
     english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
 
@@ -663,7 +585,6 @@ def build_back_card_image(pdf_bytes, password=None):
         line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
     )
 
-    # ---------- AADHAAR NUMBER + VID — front jaisi hi jagah/size/font ----------
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     draw_centered_text(
         draw, aadhaar_box, data["aadhaar_number"],
@@ -679,9 +600,6 @@ def build_back_card_image(pdf_bytes, password=None):
     return template
 
 
-# ============================================================
-# ENDPOINTS
-# ============================================================
 @app.route("/generate-card", methods=["POST"])
 def generate_card():
     if "pdf" not in request.files:
