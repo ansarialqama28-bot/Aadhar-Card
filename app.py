@@ -27,11 +27,18 @@ CONTENT_X0 = 305
 CONTENT_X1 = 975
 
 TEXT_COL_TOP = 158
-TEXT_COL_BOTTOM = 310
-ROW_GAP_DEFAULT = 34
-ROW_GAP_NO_HINDI = 34
 
-MOBILE_ROW = (CONTENT_X0, 316, CONTENT_X1, 362)
+# Har row ke beech ka gap ab ALAG-ALAG control hota hai (pehle sab
+# rows ek hi ROW_GAP use karte the). Abhi sabki value same (34) rakhi
+# hai jaisa pehle tha — ab tum inhe ek-ek karke independently badal
+# sakte ho.
+NAME_ROW_HEIGHT = 20          # Hindi Name aur English Name row ki height
+LABEL_ROW_HEIGHT = 20         # DOB / Gender / Mobile row ki height
+
+GAP_HINDI_NAME_TO_ENGLISH_NAME = 34   # Hindi Name -> English Name
+GAP_ENGLISH_NAME_TO_DOB = 34          # English Name -> DOB
+GAP_DOB_TO_GENDER = 34                # DOB -> Gender
+GAP_GENDER_TO_MOBILE = 34             # Gender -> Mobile No
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
@@ -42,6 +49,9 @@ MOBILE_FONT_SIZE = 36
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 22
 ISSUED_FONT_SIZE = 20
+
+# Front photo ki brightness kitni badhani hai (1.3 = 30% zyada)
+PHOTO_BRIGHTNESS = 1.3
 
 # ============================================================
 # CONFIG — BACK CARD (Aadhaar)
@@ -285,53 +295,92 @@ def extract_back_data(pdf_bytes, password=None):
         if not english_address:
             english_address = "N/A"
 
-        # --- Hindi address: "पता" marker ke baad se, Devanagari + "- PIN"
-        # wali line tak (address ki last line) collect karte hain, aur
-        # beech mein aa gaye front-column ke English tukdo (naam, DOB)
-        # ko surgically hata dete hain ---
-        hindi_address = "N/A"
-        start_idx = None
-        for i, line in enumerate(lines):
-            if "पता" in line:
-                start_idx = i
-                break
+        # --- Hindi address: poore PDF text mein jahan bhi Devanagari
+        # address wala block mile (sirf "पता" label ke baad hi nahi,
+        # "आत्मज" jaisa guardian-marker milne par bhi try karte hain),
+        # wahan se "- PIN" wali last line tak collect karte hain. Beech
+        # mein aa gaye front-column ke English tukdo (naam, DOB) ko
+        # surgically hata dete hain.
+        def clean_address_line(raw_line):
+            cleaned = raw_line
+            if english_name and english_name != "N/A":
+                cleaned = cleaned.replace(english_name, " ")
+            cleaned = re.sub(r"जन्म.*?DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
+            cleaned = re.sub(r"/?\s*DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
+            cleaned = cleaned.replace("\x00", "")
+            return re.sub(r"\s+", " ", cleaned).strip()
 
-        if start_idx is not None:
+        def collect_hindi_block(start_idx, label_pattern=None):
             collected = []
-            after_label = re.split(r"पता\s*:?", lines[start_idx], maxsplit=1)
-            if len(after_label) > 1 and after_label[1].strip():
-                collected.append(after_label[1].strip())
+            first_line = lines[start_idx]
+            if label_pattern:
+                parts = re.split(label_pattern, first_line, maxsplit=1)
+                remainder = parts[1].strip() if len(parts) > 1 else ""
+            else:
+                remainder = first_line.strip()
+
+            remainder = clean_address_line(remainder)
+            if remainder and DEVANAGARI_RE.search(remainder):
+                collected.append(remainder)
+
+            if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", first_line):
+                return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
 
             for j in range(start_idx + 1, min(start_idx + 8, len(lines))):
                 raw_line = lines[j]
-                cleaned = raw_line
-
-                if english_name and english_name != "N/A":
-                    cleaned = cleaned.replace(english_name, " ")
-                # Front-column ka Hindi "जन्म तिथि/DOB: <date>" label bhi
-                # kabhi kabhi isi line mein interleave ho jaata hai —
-                # use bhi (Hindi label sameet) hata do, sirf date/DOB
-                # wala number nahi.
-                cleaned = re.sub(r"जन्म.*?DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
-                cleaned = re.sub(r"/?\s*DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
-                cleaned = cleaned.replace("\x00", "")
-                cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-                if cleaned:
+                cleaned = clean_address_line(raw_line)
+                if cleaned and DEVANAGARI_RE.search(cleaned):
                     collected.append(cleaned)
-
                 if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", raw_line):
                     break
 
-            hindi_address = re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
-            if not hindi_address:
-                hindi_address = "N/A"
+            return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
+
+        hindi_address = None
+
+        # Try 1: "पता" label ke baad se
+        for i, line in enumerate(lines):
+            if "पता" in line:
+                candidate = collect_hindi_block(i, label_pattern=r"पता\s*:?")
+                if candidate:
+                    hindi_address = candidate
+                break
+
+        # Try 2: agar upar se nahi mila, "आत्मज" (guardian marker) ke
+        # aas-paas se dhoondo — PDF ke kisi bhi hisse mein ho sakta hai
+        if not hindi_address:
+            for i, line in enumerate(lines):
+                if "आत्मज" in line:
+                    candidate = collect_hindi_block(i)
+                    if candidate:
+                        hindi_address = candidate
+                    break
+
+        # Try 3: last resort — poore text mein jahan bhi Devanagari +
+        # "- 6 digit PIN" wali line mile, wahi se peeche ki 1-2 Devanagari
+        # lines bhi jod kar address bana lo
+        if not hindi_address:
+            for i, line in enumerate(lines):
+                if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", line):
+                    window_start = max(0, i - 2)
+                    candidate = collect_hindi_block(window_start)
+                    if candidate:
+                        hindi_address = candidate
+                    break
+
+        # Fallback: Hindi address kahi bhi nahi mila to Hindi ki jagah
+        # English address dikha do, aur English wali jagah khaali chhod do.
+        if hindi_address:
+            english_address_final = english_address
+        else:
+            hindi_address = english_address if english_address != "N/A" else "N/A"
+            english_address_final = ""
 
         details_as_on = find_details_as_on_date(lines, text)
 
         return {
             "hindi_address": hindi_address,
-            "english_address": english_address,
+            "english_address": english_address_final,
             "aadhaar_number": aadhaar_number,
             "vid": vid,
             "details_as_on": details_as_on,
@@ -423,19 +472,29 @@ def draw_wrapped_text(draw, box, text, font, line_gap=6, fill="#1A2238"):
 
 
 def build_content_rows(has_hindi):
-    n_rows = 4 if has_hindi else 3
-    total_h = TEXT_COL_BOTTOM - TEXT_COL_TOP
-    gap = ROW_GAP_DEFAULT if has_hindi else ROW_GAP_NO_HINDI
-    row_h = (total_h - (n_rows - 1) * gap) / n_rows
-
+    """
+    Rows ko upar se neeche stack karta hai, har pair ke beech apna
+    ALAG gap use karke (GAP_HINDI_NAME_TO_ENGLISH_NAME, waghera).
+    Return: (rows list, gender row ke neeche wala cursor — isi se
+    Mobile row ki position GAP_GENDER_TO_MOBILE jodkar nikalti hai).
+    """
     rows = []
     cursor = TEXT_COL_TOP
-    for _ in range(n_rows):
-        top = cursor
-        bottom = top + row_h
-        rows.append((CONTENT_X0, top, CONTENT_X1, bottom))
-        cursor = bottom + gap
-    return rows
+
+    if has_hindi:
+        rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + NAME_ROW_HEIGHT))
+        cursor = cursor + NAME_ROW_HEIGHT + GAP_HINDI_NAME_TO_ENGLISH_NAME
+
+    rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + NAME_ROW_HEIGHT))
+    cursor = cursor + NAME_ROW_HEIGHT + GAP_ENGLISH_NAME_TO_DOB
+
+    rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + LABEL_ROW_HEIGHT))
+    cursor = cursor + LABEL_ROW_HEIGHT + GAP_DOB_TO_GENDER
+
+    rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + LABEL_ROW_HEIGHT))
+    cursor = cursor + LABEL_ROW_HEIGHT
+
+    return rows, cursor
 
 
 GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDER": "ट्रांसजेंडर"}
@@ -463,6 +522,7 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     photo_box = scale_box(PHOTO_BOX)
     pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
     fitted = cover_fit(data["photo"], pw, ph)
+    fitted = ImageEnhance.Brightness(fitted).enhance(PHOTO_BRIGHTNESS)
     template.paste(fitted, (photo_box[0], photo_box[1]))
 
     border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
@@ -489,8 +549,11 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     template.paste(rotated, (vx, vy), rotated)
 
     has_hindi = data["hindi_name"] != "N/A"
-    raw_rows = build_content_rows(has_hindi)
+    raw_rows, cursor_after_gender = build_content_rows(has_hindi)
     rows = [scale_box(r) for r in raw_rows]
+
+    mobile_top = cursor_after_gender + GAP_GENDER_TO_MOBILE
+    mobile_row_raw = (CONTENT_X0, mobile_top, CONTENT_X1, mobile_top + LABEL_ROW_HEIGHT)
 
     name_font_size = int(NAME_FONT_SIZE * scale_y)
     label_font_size = int(LABEL_FONT_SIZE * scale_y)
@@ -518,7 +581,7 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     )
 
     if print_mobile and data["mobile_number"] != "N/A":
-        mobile_box = scale_box(MOBILE_ROW)
+        mobile_box = scale_box(mobile_row_raw)
         mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
         draw_mixed_line(
             draw, mobile_box,
