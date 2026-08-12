@@ -135,73 +135,120 @@ def find_face_photo_image(page):
     return cropped.original.convert("RGB")
 
 
-def find_issued_date(lines, full_text):
-    for i, line in enumerate(lines):
-        cleaned = re.sub(r"[^a-z]", "", line.strip().lower())
-        if cleaned == "deussi":
-            if i > 0:
-                candidate = lines[i - 1].strip()
-                rev = candidate[::-1]
-                if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", rev):
-                    return rev
-
-    m = re.search(r"\b(\d{4}/\d{2}/\d{1,2})\b", full_text)
+def find_issued_date(full_text):
+    m = re.search(r"issued\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, re.IGNORECASE)
     if m:
-        return m.group(1)[::-1]
+        return m.group(1)
     return "N/A"
+
+
+def detect_name_block(lines):
+    """
+    "DOB:" marker line dhoondh kar, uske turant upar wali 1-2 lines ko
+    "naam" maanta hai (1 agar sirf English hai, 2 agar Hindi+English
+    dono). Ye "To" ke turant baad wali line lene se ZYADA reliable hai,
+    kyunki address ka pehla hissa kabhi kabhi label ke bina (jaise
+    "Rahika Tola,") bhi aata hai aur naam jaisa dikh sakta hai — DOB ke
+    bilkul upar wali line hamesha naam hi hoti hai, kabhi address nahi.
+    """
+    dob_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"DOB\s*:", line, re.IGNORECASE):
+            dob_idx = i
+            break
+    if dob_idx is None:
+        return "N/A", "N/A", 0
+
+    def clean_name_candidate(raw):
+        return re.split(r"\s*(?:Address\s*:|VID\s*:?|S/O:|C/O:|D/O:|W/O:)", raw, maxsplit=1)[0].strip()
+
+    collected = []
+    j = dob_idx - 1
+    while j >= 0 and len(collected) < 2:
+        stripped = clean_name_candidate(lines[j].strip())
+        if not stripped:
+            j -= 1
+            continue
+        if re.search(r"issued|Aadhaar\s*no|Details\s*as\s*on|^\d|^[a-z:.]+$", stripped, re.IGNORECASE):
+            break
+        collected.insert(0, stripped)
+        j -= 1
+
+    if not collected:
+        return "N/A", "N/A", 0
+    if len(collected) == 1:
+        if DEVANAGARI_RE.search(collected[0]):
+            return collected[0], "N/A", 1
+        return "N/A", collected[0], 1
+    if DEVANAGARI_RE.search(collected[0]):
+        return collected[0], collected[1], 2
+    return "N/A", collected[-1], len(collected)
+
+
+def collect_labeled_block(lines, start_idx, label_pattern, stop_re):
+    collected = []
+    first_line = lines[start_idx]
+    parts = re.split(label_pattern, first_line, maxsplit=1)
+    remainder = parts[1].strip() if len(parts) > 1 else ""
+    if remainder:
+        collected.append(remainder)
+        if stop_re.search(remainder):
+            return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
+
+    for j in range(start_idx + 1, min(start_idx + 8, len(lines))):
+        raw_line = lines[j].strip()
+        if not raw_line:
+            continue
+        if re.match(r"^\d{4}\s\d{4}\s\d{4}$", raw_line) or re.match(r"^VID\s*:", raw_line, re.IGNORECASE):
+            break
+        collected.append(raw_line)
+        if stop_re.search(raw_line):
+            break
+
+    return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
+
+
+PIN_END_RE = re.compile(r"-\s*\d{6}\b")
 
 
 def extract_front_data(pdf_bytes, password=None):
     with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
         page = pdf.pages[0]
-        text = page.extract_text() or ""
-        lines = text.split("\n")
-
-        hindi_name = "N/A"
-        english_name = "N/A"
-        for i, line in enumerate(lines):
-            if line.strip() == "To":
-                if i + 1 < len(lines):
-                    hindi_name = lines[i + 1].strip()
-                if i + 2 < len(lines):
-                    english_name = lines[i + 2].strip()
-                break
-
-        if hindi_name != "N/A" and not DEVANAGARI_RE.search(hindi_name):
-            if english_name == "N/A":
-                english_name = hindi_name
-            hindi_name = "N/A"
-
-        m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
-        aadhaar_number = m.group(1) if m else "N/A"
-
-        m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
-        vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
-
-        m = re.search(r"DOB:\s*(\d{1,2}/\d{1,2}/\d{4})", text)
-        dob = m.group(1) if m else "N/A"
-
-        m = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", text, re.IGNORECASE)
-        gender = m.group(1).upper() if m else "N/A"
-
-        m = re.search(r"Mobile:\s*(\d{10})", text)
-        mobile_number = m.group(1) if m else "N/A"
-
-        issued_date = find_issued_date(lines, text)
-
         photo_img = find_face_photo_image(page)
 
-        return {
-            "hindi_name": hindi_name,
-            "english_name": english_name,
-            "aadhaar_number": aadhaar_number,
-            "vid": vid,
-            "dob": dob,
-            "gender": gender,
-            "mobile_number": mobile_number,
-            "issued_date": issued_date,
-            "photo": photo_img,
-        }
+    text = extract_text_pdfium(pdf_bytes, password)
+    lines = text.split("\n")
+
+    hindi_name, english_name, _ = detect_name_block(lines)
+
+    m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
+    aadhaar_number = m.group(1) if m else "N/A"
+
+    m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
+    vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
+
+    m = re.search(r"DOB:\s*(\d{1,2}/\d{1,2}/\d{4})", text)
+    dob = m.group(1) if m else "N/A"
+
+    m = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", text, re.IGNORECASE)
+    gender = m.group(1).upper() if m else "N/A"
+
+    m = re.search(r"Mobile:\s*(\d{10})", text)
+    mobile_number = m.group(1) if m else "N/A"
+
+    issued_date = find_issued_date(text)
+
+    return {
+        "hindi_name": hindi_name,
+        "english_name": english_name,
+        "aadhaar_number": aadhaar_number,
+        "vid": vid,
+        "dob": dob,
+        "gender": gender,
+        "mobile_number": mobile_number,
+        "issued_date": issued_date,
+        "photo": photo_img,
+    }
 
 
 def find_details_as_on_date(lines, full_text):
@@ -221,110 +268,37 @@ def extract_back_data(pdf_bytes, password=None):
     m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
     vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
 
-    english_name = "N/A"
+    english_address = None
     for i, line in enumerate(lines):
-        if line.strip() == "To":
-            if i + 2 < len(lines):
-                english_name = lines[i + 2].strip()
+        if line.strip() == "Address:" or line.strip().startswith("Address:"):
+            candidate = collect_labeled_block(lines, i, r"Address\s*:", PIN_END_RE)
+            if candidate:
+                english_address = candidate
             break
-
-    def field(pattern):
-        fm = re.search(pattern, text)
-        return fm.group(1).strip().rstrip(",") if fm else ""
-
-    guardian = field(r"S/O:\s*([^\n,]+)")
-    village = field(r"Village-\s*([^\n,]+)")
-    post = field(r"Post-\s*([^\n,]+)")
-    vtc = field(r"VTC:\s*([^\n,]+)")
-    po = field(r"PO:\s*([^\n,]+)")
-    district = field(r"(?<!Sub )District:\s*([^\n,]+)")
-    state = field(r"State:\s*([^\n,]+)")
-    pincode = field(r"PIN Code:\s*(\d+)")
-
-    english_parts = []
-    if guardian: english_parts.append(f"S/O: {guardian}")
-    if village: english_parts.append(f"Village- {village}")
-    if post: english_parts.append(f"Post- {post}")
-    if vtc: english_parts.append(vtc)
-    if po: english_parts.append(f"PO: {po}")
-    if district: english_parts.append(f"DIST: {district}")
-    english_address = ", ".join(english_parts)
-    tail = ", ".join(x for x in [state, pincode] if x)
-    if tail:
-        english_address = f"{english_address}, {state} - {pincode}" if (state and pincode) else f"{english_address}, {tail}"
     if not english_address:
         english_address = "N/A"
 
-    def clean_address_line(raw_line):
-        cleaned = raw_line
-        if english_name and english_name != "N/A":
-            cleaned = cleaned.replace(english_name, " ")
-        cleaned = re.sub(r"जन्म.*?DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
-        cleaned = re.sub(r"/?\s*DOB:\s*\d{1,2}/\d{1,2}/\d{4}", " ", cleaned)
-        return re.sub(r"\s+", " ", cleaned).strip()
-
-    def collect_hindi_block(start_idx, label_pattern=None):
-        collected = []
-        first_line = lines[start_idx]
-        if label_pattern:
-            parts = re.split(label_pattern, first_line, maxsplit=1)
-            remainder = parts[1].strip() if len(parts) > 1 else ""
-        else:
-            remainder = first_line.strip()
-
-        remainder = clean_address_line(remainder)
-        if remainder and DEVANAGARI_RE.search(remainder):
-            collected.append(remainder)
-
-        if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", first_line):
-            return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
-
-        for j in range(start_idx + 1, min(start_idx + 8, len(lines))):
-            raw_line = lines[j]
-            cleaned = clean_address_line(raw_line)
-            if cleaned and DEVANAGARI_RE.search(cleaned):
-                collected.append(cleaned)
-            if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", raw_line):
-                break
-
-        return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
-
     hindi_address = None
-
     for i, line in enumerate(lines):
         if "पता" in line:
-            candidate = collect_hindi_block(i, label_pattern=r"पता\s*:?")
-            if candidate:
+            candidate = collect_labeled_block(lines, i, r"पता\s*:?", PIN_END_RE)
+            if candidate and DEVANAGARI_RE.search(candidate):
                 hindi_address = candidate
             break
 
     if not hindi_address:
         for i, line in enumerate(lines):
             if "आत्मज" in line:
-                candidate = collect_hindi_block(i)
-                if candidate:
+                candidate = collect_labeled_block(lines, i, r"^", PIN_END_RE)
+                if candidate and DEVANAGARI_RE.search(candidate):
                     hindi_address = candidate
                 break
-
-    if not hindi_address:
-        for i, line in enumerate(lines):
-            if re.search(r"[\u0900-\u097F].*-\s*\d{6}\b", line):
-                candidate = collect_hindi_block(max(0, i - 2))
-                if candidate:
-                    hindi_address = candidate
-                break
-
-    if hindi_address:
-        english_address_final = english_address
-    else:
-        hindi_address = english_address if english_address != "N/A" else "N/A"
-        english_address_final = ""
 
     details_as_on = find_details_as_on_date(lines, text)
 
     return {
         "hindi_address": hindi_address,
-        "english_address": english_address_final,
+        "english_address": english_address,
         "aadhaar_number": aadhaar_number,
         "vid": vid,
         "details_as_on": details_as_on,
@@ -563,27 +537,38 @@ def build_back_card_image(pdf_bytes, password=None):
     vy = (template.height - rotated.height) // 2
     template.paste(rotated, (vx, vy), rotated)
 
-    hindi_label_box = scale_box(HINDI_LABEL_BOX)
-    hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
     label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
 
-    draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
-    draw_wrapped_text(
-        draw, hindi_addr_box, data["hindi_address"],
-        get_font("hi", False, addr_font_size),
-        line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-    )
+    if data["hindi_address"]:
+        hindi_label_box = scale_box(HINDI_LABEL_BOX)
+        hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
+        draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
+        draw_wrapped_text(
+            draw, hindi_addr_box, data["hindi_address"],
+            get_font("hi", False, addr_font_size),
+            line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+        )
 
-    english_label_box = scale_box(ENGLISH_LABEL_BOX)
-    english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
+        english_label_box = scale_box(ENGLISH_LABEL_BOX)
+        english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
+        draw_mixed_line(draw, english_label_box, [("Address:", "en")], label_font_size)
+        draw_wrapped_text(
+            draw, english_addr_box, data["english_address"],
+            get_font("en", False, addr_font_size),
+            line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+        )
+    else:
+        only_label_box = scale_box(HINDI_LABEL_BOX)
+        combined_box_raw = (HINDI_ADDRESS_BOX[0], HINDI_ADDRESS_BOX[1], ENGLISH_ADDRESS_BOX[2], ENGLISH_ADDRESS_BOX[3])
+        only_addr_box = scale_box(combined_box_raw)
 
-    draw_mixed_line(draw, english_label_box, [("Address:", "en")], label_font_size)
-    draw_wrapped_text(
-        draw, english_addr_box, data["english_address"],
-        get_font("en", False, addr_font_size),
-        line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-    )
+        draw_mixed_line(draw, only_label_box, [("Address:", "en")], label_font_size)
+        draw_wrapped_text(
+            draw, only_addr_box, data["english_address"],
+            get_font("en", False, addr_font_size),
+            line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+        )
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     draw_centered_text(
