@@ -83,7 +83,12 @@ DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
 
 
 def fix_devanagari_spacing(text):
-    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])\s+", r"\1", text)
+    # Sirf inline space/tab hi hatane hain, newline (line-breaks) kabhi
+    # nahi — warna alag-alag lines (jaise Hindi naam aur English naam,
+    # jo apni apni line par hote hain) galti se ek dusre se jud jaate
+    # hain. Sirf " " ya tab, [ \t]+, hatate hain — \n ko haath nahi
+    # lagate.
+    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -169,7 +174,7 @@ def detect_name_block(lines):
         if not stripped:
             j -= 1
             continue
-        if re.search(r"issued|Aadhaar\s*no|Details\s*as\s*on|^\d|^[a-z:.]+$", stripped, re.IGNORECASE):
+        if re.search(r"issued|Aadhaar\s*no|Details\s*as\s*on|^\d", stripped, re.IGNORECASE):
             break
         collected.insert(0, stripped)
         j -= 1
@@ -278,10 +283,12 @@ def extract_back_data(pdf_bytes, password=None):
     if not english_address:
         english_address = "N/A"
 
+    # Kuch PDFs "पता" likhte hain, kuch "पत्ता" (doubled-त, Maharashtra
+    # style) — dono ko check karte hain.
     hindi_address = None
     for i, line in enumerate(lines):
-        if "पता" in line:
-            candidate = collect_labeled_block(lines, i, r"पता\s*:?", PIN_END_RE)
+        if "पत्ता" in line or "पता" in line:
+            candidate = collect_labeled_block(lines, i, r"पत्ता\s*:?|पता\s*:?", PIN_END_RE)
             if candidate and DEVANAGARI_RE.search(candidate):
                 hindi_address = candidate
             break
