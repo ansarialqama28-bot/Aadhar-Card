@@ -81,6 +81,17 @@ FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
 
+# Characters that can NEVER be the first character of a Devanagari word
+# (dependent vowel signs/matras, virama, nukta, anusvara/candrabindu/
+# visarga, Vedic accents, invisible joiners). A "space" is only allowed
+# to be inserted directly BEFORE a character that is NOT in this set —
+# this is what stops words from getting split in the middle of a
+# conjunct or matra, which is what broke the earlier character-percent
+# approach.
+DEVANAGARI_NONSTART_RE = re.compile(
+    r"[\u0900-\u0903\u093C\u093E-\u094D\u0951-\u0957\u200C\u200D]"
+)
+
 
 def fix_devanagari_spacing(text):
     # Sirf inline space/tab hi hatane hain, newline (line-breaks) kabhi
@@ -92,59 +103,92 @@ def fix_devanagari_spacing(text):
 
 
 # ============================================================
-# NAYA: Hindi address ki spacing ko English address ke "clean"
-# structure ke hisaab se realign karna.
+# NAYA (v2): Comma-segment + valid-word-boundary based Hindi
+# spacing fix.
 #
-# Jugad: Hindi text me PDF se extract hote waqt kahin spaces missing
-# ho jaate hain (do shabd jud jaate hain) aur kahin galat jagah aa
-# jaate hain (ek shabd toot jata hai). English address usually saaf
-# aata hai. To hum poore Hindi address ke saare spaces pehle hata
-# dete hain (ek continuous Devanagari string ban jaati hai), fir
-# English address me jahan-jahan space hai uski RELATIVE position
-# (poori string ki lambai ka kitna %) nikaal kar, wahi-wahi relative
-# position par Hindi ki compact string me space wapas daal dete hain.
-# Isse dono addresses same structure/order ke hone ki wajah se words
-# lagbhag sahi jagah par wapas align ho jaate hain.
+# Purani approach (character ka % position copy karna) tootti thi
+# kyunki Hindi conjuncts/matras ka character-count English letters se
+# match nahi karta — thoda sa mismatch hote hi space ekdum galat jagah
+# (matra ke beech me) chala jaata tha.
+#
+# Naya tareeka:
+#   1. Hindi aur English address ko COMMA se segments me todte hain.
+#      Agar segment-count match nahi hui, kuch bhi nahi badalte
+#      (safe fallback — purana Hindi address hi wapas).
+#   2. Har matching segment-pair ke liye: Hindi segment ke saare
+#      spaces hata kar ek compact string banate hain, phir sirf UN
+#      positions par space insert karte hain jo Devanagari ke hisaab
+#      se ek naye word ki VALID shuruaat ho sakti hain (matra/virama
+#      ke turant pehle kabhi nahi) — English word-lengths ka ratio
+#      sirf ye decide karne ke liye use hota hai ki in valid
+#      positions me se KAUNSI sahi jagah hai.
 # ============================================================
+def _align_segment_spacing(hindi_seg, english_seg):
+    compact = re.sub(r"\s+", "", hindi_seg)
+    if not compact:
+        return hindi_seg
+
+    english_words = english_seg.split()
+    if len(english_words) <= 1:
+        return compact  # single word — koi internal space chahiye hi nahi
+
+    n = len(compact)
+    weights = [len(w) for w in english_words]
+    total_weight = sum(weights) or 1
+
+    # Har word-boundary ki target (proportional) position nikalna
+    target_positions = []
+    cum = 0
+    for w in weights[:-1]:
+        cum += w
+        target_positions.append(round((cum / total_weight) * n))
+
+    # Sirf wahi positions valid hain jahan naya word shuru ho sakta hai
+    valid_positions = [
+        i for i in range(1, n)
+        if not DEVANAGARI_NONSTART_RE.match(compact[i])
+    ]
+    if not valid_positions:
+        return compact  # koi safe break point nahi mila — chhedo mat
+
+    chosen = []
+    for target in target_positions:
+        candidates = sorted(valid_positions, key=lambda p: abs(p - target))
+        for c in candidates:
+            if c not in chosen and (not chosen or c > chosen[-1]):
+                chosen.append(c)
+                break
+
+    chosen = sorted(set(chosen))
+    result_chars = list(compact)
+    for idx in reversed(chosen):
+        result_chars.insert(idx, " ")
+
+    return "".join(result_chars)
+
+
 def align_hindi_spacing_using_english(hindi_addr, english_addr):
     if not hindi_addr or hindi_addr == "N/A":
         return hindi_addr
     if not english_addr or english_addr == "N/A":
         return hindi_addr
 
-    # Hindi address ke saare whitespace hata kar ek compact string banayein
-    hindi_compact = re.sub(r"\s+", "", hindi_addr)
-    if not hindi_compact:
+    hindi_segments = [s.strip() for s in hindi_addr.split(",")]
+    english_segments = [s.strip() for s in english_addr.split(",")]
+
+    # Segment count match nahi hua to risk nahi lete — original wapas
+    if len(hindi_segments) != len(english_segments):
         return hindi_addr
 
-    eng_len = len(english_addr)
-    if eng_len == 0:
-        return hindi_addr
+    fixed_segments = []
+    for h_seg, e_seg in zip(hindi_segments, english_segments):
+        if not h_seg:
+            fixed_segments.append(h_seg)
+            continue
+        fixed_segments.append(_align_segment_spacing(h_seg, e_seg))
 
-    # English address me space ki positions (character index) nikalna
-    space_positions = [i for i, ch in enumerate(english_addr) if ch == " "]
-    if not space_positions:
-        return hindi_compact
-
-    hindi_len = len(hindi_compact)
-
-    # Har English space ki relative position (0..1) nikal kar,
-    # wahi relative position hindi_compact ki length par apply karke
-    # target insertion index nikalna
-    insert_at = sorted(set(
-        min(hindi_len, max(1, round((pos / eng_len) * hindi_len)))
-        for pos in space_positions
-    ))
-
-    result_chars = list(hindi_compact)
-    # End se insert karte hain taaki pehle wale indices shift na hon
-    for idx in reversed(insert_at):
-        result_chars.insert(idx, " ")
-
-    result = "".join(result_chars)
-    # Double spaces ya leading/trailing space clean karna
-    result = re.sub(r"\s+", " ", result).strip()
-    return result
+    result = ", ".join(s for s in fixed_segments if s)
+    return result if result else hindi_addr
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -357,8 +401,7 @@ def extract_back_data(pdf_bytes, password=None):
                     hindi_address = candidate
                 break
 
-    # NAYA: English address ke structure ka use karke Hindi address ki
-    # spacing fix karna (jugad wala step)
+    # v2 fix: comma-segment + valid-word-boundary based realignment
     if hindi_address and english_address:
         hindi_address = align_hindi_spacing_using_english(hindi_address, english_address)
 
