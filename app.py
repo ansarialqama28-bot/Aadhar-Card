@@ -91,6 +91,62 @@ def fix_devanagari_spacing(text):
     return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
 
 
+# ============================================================
+# NAYA: Hindi address ki spacing ko English address ke "clean"
+# structure ke hisaab se realign karna.
+#
+# Jugad: Hindi text me PDF se extract hote waqt kahin spaces missing
+# ho jaate hain (do shabd jud jaate hain) aur kahin galat jagah aa
+# jaate hain (ek shabd toot jata hai). English address usually saaf
+# aata hai. To hum poore Hindi address ke saare spaces pehle hata
+# dete hain (ek continuous Devanagari string ban jaati hai), fir
+# English address me jahan-jahan space hai uski RELATIVE position
+# (poori string ki lambai ka kitna %) nikaal kar, wahi-wahi relative
+# position par Hindi ki compact string me space wapas daal dete hain.
+# Isse dono addresses same structure/order ke hone ki wajah se words
+# lagbhag sahi jagah par wapas align ho jaate hain.
+# ============================================================
+def align_hindi_spacing_using_english(hindi_addr, english_addr):
+    if not hindi_addr or hindi_addr == "N/A":
+        return hindi_addr
+    if not english_addr or english_addr == "N/A":
+        return hindi_addr
+
+    # Hindi address ke saare whitespace hata kar ek compact string banayein
+    hindi_compact = re.sub(r"\s+", "", hindi_addr)
+    if not hindi_compact:
+        return hindi_addr
+
+    eng_len = len(english_addr)
+    if eng_len == 0:
+        return hindi_addr
+
+    # English address me space ki positions (character index) nikalna
+    space_positions = [i for i, ch in enumerate(english_addr) if ch == " "]
+    if not space_positions:
+        return hindi_compact
+
+    hindi_len = len(hindi_compact)
+
+    # Har English space ki relative position (0..1) nikal kar,
+    # wahi relative position hindi_compact ki length par apply karke
+    # target insertion index nikalna
+    insert_at = sorted(set(
+        min(hindi_len, max(1, round((pos / eng_len) * hindi_len)))
+        for pos in space_positions
+    ))
+
+    result_chars = list(hindi_compact)
+    # End se insert karte hain taaki pehle wale indices shift na hon
+    for idx in reversed(insert_at):
+        result_chars.insert(idx, " ")
+
+    result = "".join(result_chars)
+    # Double spaces ya leading/trailing space clean karna
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
 def extract_text_pdfium(pdf_bytes, password=None):
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes), password=password or None)
     try:
@@ -300,6 +356,11 @@ def extract_back_data(pdf_bytes, password=None):
                 if candidate and DEVANAGARI_RE.search(candidate):
                     hindi_address = candidate
                 break
+
+    # NAYA: English address ke structure ka use karke Hindi address ki
+    # spacing fix karna (jugad wala step)
+    if hindi_address and english_address:
+        hindi_address = align_hindi_spacing_using_english(hindi_address, english_address)
 
     details_as_on = find_details_as_on_date(lines, text)
 
