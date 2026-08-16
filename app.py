@@ -81,17 +81,6 @@ FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
 
-# Characters that can NEVER be the first character of a Devanagari word
-# (dependent vowel signs/matras, virama, nukta, anusvara/candrabindu/
-# visarga, Vedic accents, invisible joiners). A "space" is only allowed
-# to be inserted directly BEFORE a character that is NOT in this set —
-# this is what stops words from getting split in the middle of a
-# conjunct or matra, which is what broke the earlier character-percent
-# approach.
-DEVANAGARI_NONSTART_RE = re.compile(
-    r"[\u0900-\u0903\u093C\u093E-\u094D\u0951-\u0957\u200C\u200D]"
-)
-
 
 def fix_devanagari_spacing(text):
     # Sirf inline space/tab hi hatane hain, newline (line-breaks) kabhi
@@ -103,92 +92,100 @@ def fix_devanagari_spacing(text):
 
 
 # ============================================================
-# NAYA (v2): Comma-segment + valid-word-boundary based Hindi
-# spacing fix.
+# HINDI ADDRESS — ab text ki jagah IMAGE crop use karte hain.
 #
-# Purani approach (character ka % position copy karna) tootti thi
-# kyunki Hindi conjuncts/matras ka character-count English letters se
-# match nahi karta — thoda sa mismatch hote hi space ekdum galat jagah
-# (matra ke beech me) chala jaata tha.
+# Diagnosis (PDF file pe directly test karke confirm kiya): is tarah
+# ke Aadhaar PDFs ke Devanagari font ka ToUnicode CMap kayi jagah
+# PERMANENTLY corrupt hota hai — kuch matras (jaise ि, ं) extraction
+# ke waqt NULL character (\x00) ban jaate hain. Ye information text
+# se hamesha ke liye gayab hai, koi bhi spacing/reconstruction logic
+# ise wapas nahi la sakti, kyunki data hi missing hai.
 #
-# Naya tareeka:
-#   1. Hindi aur English address ko COMMA se segments me todte hain.
-#      Agar segment-count match nahi hui, kuch bhi nahi badalte
-#      (safe fallback — purana Hindi address hi wapas).
-#   2. Har matching segment-pair ke liye: Hindi segment ke saare
-#      spaces hata kar ek compact string banate hain, phir sirf UN
-#      positions par space insert karte hain jo Devanagari ke hisaab
-#      se ek naye word ki VALID shuruaat ho sakti hain (matra/virama
-#      ke turant pehle kabhi nahi) — English word-lengths ka ratio
-#      sirf ye decide karne ke liye use hota hai ki in valid
-#      positions me se KAUNSI sahi jagah hai.
+# Isliye Hindi address ko text ki tarah dobara type/draw karne ki
+# jagah, hum PDF ke usi hisse ko seedha ek IMAGE ke roop me crop kar
+# lete hain (jaise face-photo crop karte hain) — jo bhi PDF me
+# visually sahi dikh raha hai, wahi pixel-perfect copy ho jaata hai,
+# koi encoding issue hi nahi aata.
 # ============================================================
-def _align_segment_spacing(hindi_seg, english_seg):
-    compact = re.sub(r"\s+", "", hindi_seg)
-    if not compact:
-        return hindi_seg
+def crop_hindi_address_image(pdf_bytes, password=None, resolution=400):
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+            chars = page.chars
+            if not chars:
+                return None
 
-    english_words = english_seg.split()
-    if len(english_words) <= 1:
-        return compact  # single word — koi internal space chahiye hi nahi
+            rows = {}
+            for c in chars:
+                key = round(c["top"], 1)
+                rows.setdefault(key, []).append(c)
 
-    n = len(compact)
-    weights = [len(w) for w in english_words]
-    total_weight = sum(weights) or 1
+            def row_text(cs):
+                return "".join(c["text"] for c in sorted(cs, key=lambda c: c["x0"]))
 
-    # Har word-boundary ki target (proportional) position nikalna
-    target_positions = []
-    cum = 0
-    for w in weights[:-1]:
-        cum += w
-        target_positions.append(round((cum / total_weight) * n))
+            sorted_tops = sorted(rows.keys())
 
-    # Sirf wahi positions valid hain jahan naya word shuru ho sakta hai
-    valid_positions = [
-        i for i in range(1, n)
-        if not DEVANAGARI_NONSTART_RE.match(compact[i])
-    ]
-    if not valid_positions:
-        return compact  # koi safe break point nahi mila — chhedo mat
+            content_start_top = None
+            column_x_min = None
 
-    chosen = []
-    for target in target_positions:
-        candidates = sorted(valid_positions, key=lambda p: abs(p - target))
-        for c in candidates:
-            if c not in chosen and (not chosen or c > chosen[-1]):
-                chosen.append(c)
-                break
+            for top in sorted_tops:
+                txt = row_text(rows[top])
+                # "पत्ता" label wala pattern — label ke turant baad se content
+                if "पत" in txt and "आत्मज" not in txt:
+                    content_start_top = max(c["bottom"] for c in rows[top])
+                    column_x_min = min(c["x0"] for c in rows[top])
+                    break
+                # "आत्मज..." se seedha address shuru hone wala pattern —
+                # isi row se content maana jaata hai
+                if "आत्मज" in txt:
+                    content_start_top = top - 1
+                    column_x_min = min(c["x0"] for c in rows[top])
+                    break
 
-    chosen = sorted(set(chosen))
-    result_chars = list(compact)
-    for idx in reversed(chosen):
-        result_chars.insert(idx, " ")
+            if content_start_top is None:
+                return None  # is PDF me Hindi address hai hi nahi
 
-    return "".join(result_chars)
+            # Agle "Address" (English) label tak — same column me — ye
+            # Hindi block ka end-boundary hai
+            end_top = None
+            for top in sorted_tops:
+                if top <= content_start_top:
+                    continue
+                cs_in_col = [c for c in rows[top] if c["x0"] >= column_x_min - 15]
+                if not cs_in_col:
+                    continue
+                if "Address" in row_text(cs_in_col):
+                    end_top = top
+                    break
+            if end_top is None:
+                end_top = content_start_top + 120  # safe fallback
 
+            column_x_max = column_x_min + 420  # QR code se pehle tak
 
-def align_hindi_spacing_using_english(hindi_addr, english_addr):
-    if not hindi_addr or hindi_addr == "N/A":
-        return hindi_addr
-    if not english_addr or english_addr == "N/A":
-        return hindi_addr
+            block_chars = [
+                c for c in chars
+                if content_start_top < c["top"] < end_top
+                and column_x_min - 5 <= c["x0"] < column_x_max
+            ]
+            if not block_chars:
+                return None
 
-    hindi_segments = [s.strip() for s in hindi_addr.split(",")]
-    english_segments = [s.strip() for s in english_addr.split(",")]
+            x0 = min(c["x0"] for c in block_chars)
+            x1 = max(c["x1"] for c in block_chars)
+            top = min(c["top"] for c in block_chars)
+            bottom = min(max(c["bottom"] for c in block_chars), end_top - 3)
 
-    # Segment count match nahi hua to risk nahi lete — original wapas
-    if len(hindi_segments) != len(english_segments):
-        return hindi_addr
+            bbox = (
+                max(0, x0 - 3), max(0, top - 2),
+                min(page.width, x1 + 3), min(page.height, bottom)
+            )
+            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                return None
 
-    fixed_segments = []
-    for h_seg, e_seg in zip(hindi_segments, english_segments):
-        if not h_seg:
-            fixed_segments.append(h_seg)
-            continue
-        fixed_segments.append(_align_segment_spacing(h_seg, e_seg))
-
-    result = ", ".join(s for s in fixed_segments if s)
-    return result if result else hindi_addr
+            cropped = page.crop(bbox).to_image(resolution=resolution)
+            return cropped.original.convert("RGB")
+    except Exception:
+        return None
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -384,7 +381,9 @@ def extract_back_data(pdf_bytes, password=None):
         english_address = "N/A"
 
     # Kuch PDFs "पता" likhte hain, kuch "पत्ता" (doubled-त, Maharashtra
-    # style) — dono ko check karte hain.
+    # style) — dono ko check karte hain. Ye text sirf "has_hindi" check
+    # aur emergency-fallback ke liye hai — asli display ab image-crop
+    # se hoti hai (neeche build_back_card_image me).
     hindi_address = None
     for i, line in enumerate(lines):
         if "पत्ता" in line or "पता" in line:
@@ -400,10 +399,6 @@ def extract_back_data(pdf_bytes, password=None):
                 if candidate and DEVANAGARI_RE.search(candidate):
                     hindi_address = candidate
                 break
-
-    # v2 fix: comma-segment + valid-word-boundary based realignment
-    if hindi_address and english_address:
-        hindi_address = align_hindi_spacing_using_english(hindi_address, english_address)
 
     details_as_on = find_details_as_on_date(lines, text)
 
@@ -429,6 +424,21 @@ def cover_fit(img, box_w, box_h):
     left = (new_w - box_w) // 2
     top = (new_h - box_h) // 2
     return resized.crop((left, top, left + box_w, top + box_h))
+
+
+def contain_fit(img, box_w, box_h):
+    # cover_fit jaisa, lekin CROP nahi karta — poori image bina kate
+    # box ke andar fit ho jaati hai (address text ka koi hissa kabhi
+    # cut nahi hona chahiye, isliye ye "contain" style zaroori hai).
+    img_ratio = img.width / img.height
+    box_ratio = box_w / box_h
+    if img_ratio > box_ratio:
+        new_w = box_w
+        new_h = max(1, int(box_w / img_ratio))
+    else:
+        new_h = box_h
+        new_w = max(1, int(box_h * img_ratio))
+    return img.resize((new_w, new_h), Image.LANCZOS)
 
 
 def draw_centered_text(draw, box, text, font, fill="#1A2238"):
@@ -652,14 +662,27 @@ def build_back_card_image(pdf_bytes, password=None):
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
 
     if data["hindi_address"]:
+        # Ab Hindi address TEXT se draw nahi hota — PDF se seedha IMAGE
+        # crop karke paste karte hain (encoding-safe, pixel-perfect).
+        hindi_img = crop_hindi_address_image(pdf_bytes, password)
+
         hindi_label_box = scale_box(HINDI_LABEL_BOX)
         hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
         draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
-        draw_wrapped_text(
-            draw, hindi_addr_box, data["hindi_address"],
-            get_font("hi", False, addr_font_size),
-            line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-        )
+
+        if hindi_img is not None:
+            box_w = hindi_addr_box[2] - hindi_addr_box[0]
+            box_h = hindi_addr_box[3] - hindi_addr_box[1]
+            fitted_hindi = contain_fit(hindi_img, box_w, box_h)
+            template.paste(fitted_hindi, (hindi_addr_box[0], hindi_addr_box[1]))
+        else:
+            # Fallback: agar image-crop kisi wajah se fail ho jaaye,
+            # to purana text-draw hi use kar lo (better than nothing)
+            draw_wrapped_text(
+                draw, hindi_addr_box, data["hindi_address"],
+                get_font("hi", False, addr_font_size),
+                line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+            )
 
         english_label_box = scale_box(ENGLISH_LABEL_BOX)
         english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
