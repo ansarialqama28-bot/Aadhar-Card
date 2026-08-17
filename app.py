@@ -92,100 +92,121 @@ def fix_devanagari_spacing(text):
 
 
 # ============================================================
-# HINDI ADDRESS — ab text ki jagah IMAGE crop use karte hain.
+# ADDRESS (Hindi + English) — dono ab IMAGE crop se aate hain,
+# text-draw se nahi.
 #
-# Diagnosis (PDF file pe directly test karke confirm kiya): is tarah
-# ke Aadhaar PDFs ke Devanagari font ka ToUnicode CMap kayi jagah
-# PERMANENTLY corrupt hota hai — kuch matras (jaise ि, ं) extraction
-# ke waqt NULL character (\x00) ban jaate hain. Ye information text
-# se hamesha ke liye gayab hai, koi bhi spacing/reconstruction logic
-# ise wapas nahi la sakti, kyunki data hi missing hai.
+# Diagnosis (asli PDF pe test karke confirm kiya): is font ka
+# ToUnicode encoding kai jagah PERMANENTLY corrupt hai (kuch matras
+# NULL character ban jaate hain) — text se ye information hamesha ke
+# liye gayab hai. Isliye address ko text ki tarah dobara type karne
+# ki jagah, PDF se seedha uska IMAGE crop nikaal ke card pe paste
+# karte hain — jo bhi PDF me visually sahi dikh raha hai (Hindi aur
+# English dono), wahi pixel-perfect copy hota hai.
 #
-# Isliye Hindi address ko text ki tarah dobara type/draw karne ki
-# jagah, hum PDF ke usi hisse ko seedha ek IMAGE ke roop me crop kar
-# lete hain (jaise face-photo crop karte hain) — jo bhi PDF me
-# visually sahi dikh raha hai, wahi pixel-perfect copy ho jaata hai,
-# koi encoding issue hi nahi aata.
+# Zaroori fix: ek hi visual "line" PDF ke andar kabhi-kabhi 2-3 alag
+# font-runs me todi hoti hai (jaise Devanagari letters ek run me,
+# beech ke punctuation/number dusre run me) jinke vertical position
+# (top) me sirf 0.5-2 point ka farak hota hai. Isliye characters ko
+# "line" me group karte waqt EXACT top-match nahi, balki ek chhoti
+# GAP-TOLERANCE (agar do characters ka top-farak thoda sa hai to
+# wahi line, bada hai to nayi line) use karte hain — warna beech
+# ki lines silently kat jaati hain.
 # ============================================================
-def crop_hindi_address_image(pdf_bytes, password=None, resolution=400):
+def _cluster_lines(chars, gap_threshold=4.0):
+    if not chars:
+        return []
+    cs = sorted(chars, key=lambda c: c["top"])
+    lines = []
+    current = [cs[0]]
+    current_min_top = cs[0]["top"]
+    for c in cs[1:]:
+        if c["top"] - current_min_top <= gap_threshold:
+            current.append(c)
+            current_min_top = min(current_min_top, c["top"])
+        else:
+            lines.append(current)
+            current = [c]
+            current_min_top = c["top"]
+    lines.append(current)
+    return lines
+
+
+def _line_text(line_chars):
+    return "".join(c["text"] for c in sorted(line_chars, key=lambda c: c["x0"]))
+
+
+def _bbox_from_lines(line_list, pad_x=3, pad_top=2, pad_bottom=2):
+    all_chars = [c for lc in line_list for c in lc]
+    if not all_chars:
+        return None
+    x0 = min(c["x0"] for c in all_chars)
+    x1 = max(c["x1"] for c in all_chars)
+    top = min(c["top"] for c in all_chars)
+    bottom = max(c["bottom"] for c in all_chars)
+    return (x0 - pad_x, top - pad_top, x1 + pad_x, bottom + pad_bottom)
+
+
+def crop_address_images(pdf_bytes, password=None, resolution=400):
+    """
+    Returns (hindi_image, english_image) — dono PIL Image (RGB) ya
+    None agar us block ko reliably locate nahi kar paaye (caller
+    text-draw fallback use kar sakta hai).
+    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
             chars = page.chars
             if not chars:
-                return None
+                return None, None
 
-            rows = {}
-            for c in chars:
-                key = round(c["top"], 1)
-                rows.setdefault(key, []).append(c)
+            # Right-column (address side) chars — left-margin ki
+            # rotated "Details as on" text aur far-right ki rotated
+            # number-column ko exclude karte hain.
+            region_chars = [c for c in chars if c["x0"] >= 300]
+            lines = _cluster_lines(region_chars)
 
-            def row_text(cs):
-                return "".join(c["text"] for c in sorted(cs, key=lambda c: c["x0"]))
+            hindi_label_idx = None
+            address_label_idx = None
+            end_idx = None
 
-            sorted_tops = sorted(rows.keys())
+            for i, lc in enumerate(lines):
+                t = _line_text(lc)
+                if hindi_label_idx is None and (("पत" in t and "आत्मज" not in t) or "आत्मज" in t):
+                    hindi_label_idx = i
+                if address_label_idx is None and "Address" in t:
+                    address_label_idx = i
 
-            content_start_top = None
-            column_x_min = None
+            if address_label_idx is None:
+                return None, None
 
-            for top in sorted_tops:
-                txt = row_text(rows[top])
-                # "पत्ता" label wala pattern — label ke turant baad se content
-                if "पत" in txt and "आत्मज" not in txt:
-                    content_start_top = max(c["bottom"] for c in rows[top])
-                    column_x_min = min(c["x0"] for c in rows[top])
+            # English address ke baad aadhaar number (4-4-4 digit
+            # group) wali line dhoondo — English block ka end-boundary
+            for i in range(address_label_idx + 1, len(lines)):
+                t = _line_text(lines[i]).replace(" ", "")
+                if re.search(r"\d{4}\d{4}\d{4}", t):
+                    end_idx = i
                     break
-                # "आत्मज..." se seedha address shuru hone wala pattern —
-                # isi row se content maana jaata hai
-                if "आत्मज" in txt:
-                    content_start_top = top - 1
-                    column_x_min = min(c["x0"] for c in rows[top])
-                    break
+            if end_idx is None:
+                end_idx = min(address_label_idx + 6, len(lines))
 
-            if content_start_top is None:
-                return None  # is PDF me Hindi address hai hi nahi
+            hindi_img = None
+            if hindi_label_idx is not None and hindi_label_idx < address_label_idx:
+                hindi_lines = lines[hindi_label_idx + 1: address_label_idx]
+                bbox = _bbox_from_lines(hindi_lines, pad_top=1, pad_bottom=1)
+                if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                    cropped = page.crop(bbox).to_image(resolution=resolution)
+                    hindi_img = cropped.original.convert("RGB")
 
-            # Agle "Address" (English) label tak — same column me — ye
-            # Hindi block ka end-boundary hai
-            end_top = None
-            for top in sorted_tops:
-                if top <= content_start_top:
-                    continue
-                cs_in_col = [c for c in rows[top] if c["x0"] >= column_x_min - 15]
-                if not cs_in_col:
-                    continue
-                if "Address" in row_text(cs_in_col):
-                    end_top = top
-                    break
-            if end_top is None:
-                end_top = content_start_top + 120  # safe fallback
+            english_img = None
+            english_lines = lines[address_label_idx + 1: end_idx]
+            bbox = _bbox_from_lines(english_lines, pad_top=1, pad_bottom=1)
+            if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                cropped = page.crop(bbox).to_image(resolution=resolution)
+                english_img = cropped.original.convert("RGB")
 
-            column_x_max = column_x_min + 420  # QR code se pehle tak
-
-            block_chars = [
-                c for c in chars
-                if content_start_top < c["top"] < end_top
-                and column_x_min - 5 <= c["x0"] < column_x_max
-            ]
-            if not block_chars:
-                return None
-
-            x0 = min(c["x0"] for c in block_chars)
-            x1 = max(c["x1"] for c in block_chars)
-            top = min(c["top"] for c in block_chars)
-            bottom = min(max(c["bottom"] for c in block_chars), end_top - 3)
-
-            bbox = (
-                max(0, x0 - 3), max(0, top - 2),
-                min(page.width, x1 + 3), min(page.height, bottom)
-            )
-            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-                return None
-
-            cropped = page.crop(bbox).to_image(resolution=resolution)
-            return cropped.original.convert("RGB")
+            return hindi_img, english_img
     except Exception:
-        return None
+        return None, None
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -527,6 +548,11 @@ GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDE
 
 
 def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
+    # NOTE: front card sirf structured fields (naam, DOB, gender,
+    # mobile, aadhaar no, VID) use karta hai — ye sab clean/reliable
+    # tarike se text se hi extract hote hain, isliye front card
+    # scanning (text extraction) hi rehti hai, image-crop yahan
+    # zaroori nahi.
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
         raise ValueError("PDF mein se chehre wali photo nahi mil payi")
@@ -661,23 +687,21 @@ def build_back_card_image(pdf_bytes, password=None):
     label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
 
-    if data["hindi_address"]:
-        # Ab Hindi address TEXT se draw nahi hota — PDF se seedha IMAGE
-        # crop karke paste karte hain (encoding-safe, pixel-perfect).
-        hindi_img = crop_hindi_address_image(pdf_bytes, password)
+    # Address ka image-crop (Hindi + English dono) ek hi baar nikal lo
+    hindi_crop, english_crop = crop_address_images(pdf_bytes, password)
 
+    if data["hindi_address"]:
         hindi_label_box = scale_box(HINDI_LABEL_BOX)
         hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
         draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
 
-        if hindi_img is not None:
+        if hindi_crop is not None:
             box_w = hindi_addr_box[2] - hindi_addr_box[0]
             box_h = hindi_addr_box[3] - hindi_addr_box[1]
-            fitted_hindi = contain_fit(hindi_img, box_w, box_h)
+            fitted_hindi = contain_fit(hindi_crop, box_w, box_h)
             template.paste(fitted_hindi, (hindi_addr_box[0], hindi_addr_box[1]))
         else:
-            # Fallback: agar image-crop kisi wajah se fail ho jaaye,
-            # to purana text-draw hi use kar lo (better than nothing)
+            # Fallback: image-crop fail ho jaaye to purana text-draw
             draw_wrapped_text(
                 draw, hindi_addr_box, data["hindi_address"],
                 get_font("hi", False, addr_font_size),
@@ -687,22 +711,36 @@ def build_back_card_image(pdf_bytes, password=None):
         english_label_box = scale_box(ENGLISH_LABEL_BOX)
         english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
         draw_mixed_line(draw, english_label_box, [("Address:", "en")], label_font_size)
-        draw_wrapped_text(
-            draw, english_addr_box, data["english_address"],
-            get_font("en", False, addr_font_size),
-            line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-        )
+
+        if english_crop is not None:
+            box_w = english_addr_box[2] - english_addr_box[0]
+            box_h = english_addr_box[3] - english_addr_box[1]
+            fitted_english = contain_fit(english_crop, box_w, box_h)
+            template.paste(fitted_english, (english_addr_box[0], english_addr_box[1]))
+        else:
+            draw_wrapped_text(
+                draw, english_addr_box, data["english_address"],
+                get_font("en", False, addr_font_size),
+                line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+            )
     else:
         only_label_box = scale_box(HINDI_LABEL_BOX)
         combined_box_raw = (HINDI_ADDRESS_BOX[0], HINDI_ADDRESS_BOX[1], ENGLISH_ADDRESS_BOX[2], ENGLISH_ADDRESS_BOX[3])
         only_addr_box = scale_box(combined_box_raw)
 
         draw_mixed_line(draw, only_label_box, [("Address:", "en")], label_font_size)
-        draw_wrapped_text(
-            draw, only_addr_box, data["english_address"],
-            get_font("en", False, addr_font_size),
-            line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-        )
+
+        if english_crop is not None:
+            box_w = only_addr_box[2] - only_addr_box[0]
+            box_h = only_addr_box[3] - only_addr_box[1]
+            fitted_english = contain_fit(english_crop, box_w, box_h)
+            template.paste(fitted_english, (only_addr_box[0], only_addr_box[1]))
+        else:
+            draw_wrapped_text(
+                draw, only_addr_box, data["english_address"],
+                get_font("en", False, addr_font_size),
+                line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+            )
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     draw_centered_text(
