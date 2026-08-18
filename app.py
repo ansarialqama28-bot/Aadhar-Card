@@ -32,10 +32,10 @@ TEXT_COL_TOP = 158
 NAME_ROW_HEIGHT = 20
 LABEL_ROW_HEIGHT = 20
 
-GAP_HINDI_NAME_TO_ENGLISH_NAME = 14
-GAP_ENGLISH_NAME_TO_DOB = 14
-GAP_DOB_TO_GENDER = 14
-GAP_GENDER_TO_MOBILE = 14
+GAP_HINDI_NAME_TO_ENGLISH_NAME = 34
+GAP_ENGLISH_NAME_TO_DOB = 34
+GAP_DOB_TO_GENDER = 34
+GAP_GENDER_TO_MOBILE = 34
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
@@ -93,24 +93,7 @@ def fix_devanagari_spacing(text):
 
 # ============================================================
 # ADDRESS (Hindi + English) — dono ab IMAGE crop se aate hain,
-# text-draw se nahi.
-#
-# Diagnosis (asli PDF pe test karke confirm kiya): is font ka
-# ToUnicode encoding kai jagah PERMANENTLY corrupt hai (kuch matras
-# NULL character ban jaate hain) — text se ye information hamesha ke
-# liye gayab hai. Isliye address ko text ki tarah dobara type karne
-# ki jagah, PDF se seedha uska IMAGE crop nikaal ke card pe paste
-# karte hain — jo bhi PDF me visually sahi dikh raha hai (Hindi aur
-# English dono), wahi pixel-perfect copy hota hai.
-#
-# Zaroori fix: ek hi visual "line" PDF ke andar kabhi-kabhi 2-3 alag
-# font-runs me todi hoti hai (jaise Devanagari letters ek run me,
-# beech ke punctuation/number dusre run me) jinke vertical position
-# (top) me sirf 0.5-2 point ka farak hota hai. Isliye characters ko
-# "line" me group karte waqt EXACT top-match nahi, balki ek chhoti
-# GAP-TOLERANCE (agar do characters ka top-farak thoda sa hai to
-# wahi line, bada hai to nayi line) use karte hain — warna beech
-# ki lines silently kat jaati hain.
+# text-draw se nahi. (Details neeche functions ke comments me.)
 # ============================================================
 def _cluster_lines(chars, gap_threshold=4.0):
     if not chars:
@@ -149,8 +132,25 @@ def _bbox_from_lines(line_list, pad_x=3, pad_top=2, pad_bottom=2):
 def crop_address_images(pdf_bytes, password=None, resolution=400):
     """
     Returns (hindi_image, english_image) — dono PIL Image (RGB) ya
-    None agar us block ko reliably locate nahi kar paaye (caller
-    text-draw fallback use kar sakta hai).
+    None agar us block ko reliably locate nahi kar paaye.
+
+    Diagnosis (asli PDF pe test karke confirm kiya):
+    1. Is font ka ToUnicode encoding kai jagah PERMANENTLY corrupt hai
+       (kuch matras NULL character ban jaate hain) — isliye address
+       text ki tarah dobara type karne ki jagah, PDF se seedha IMAGE
+       crop kar ke card pe paste karte hain (Hindi aur English dono).
+    2. Ek hi visual "line" PDF ke andar kabhi-kabhi 2-3 alag font-runs
+       me todi hoti hai (Devanagari letters ek run, punctuation/number
+       dusra run) jinke top-position me sirf 0.2-2 point ka farak
+       hota hai. Isliye characters ko "line" me group karte waqt
+       chhoti GAP-TOLERANCE use karte hain, warna beech ki lines
+       silently kat jaati hain.
+    3. Page par ek ROTATED ("Details As On: dd/mm/yyyy") text element
+       bhi hota hai, jiske individual (rotated) characters ka x0/top
+       kabhi-kabhi humare address-block ke bilkul paas girta hai aur
+       galti se crop me shaamil ho jaata hai. pdfplumber har character
+       par `upright` flag deta hai (rotated text ke liye False) —
+       isse explicitly exclude karte hain.
     """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
@@ -159,10 +159,13 @@ def crop_address_images(pdf_bytes, password=None, resolution=400):
             if not chars:
                 return None, None
 
-            # Right-column (address side) chars — left-margin ki
-            # rotated "Details as on" text aur far-right ki rotated
-            # number-column ko exclude karte hain.
-            region_chars = [c for c in chars if c["x0"] >= 300]
+            # Right-column (address side) chars — sirf UPRIGHT (non-
+            # rotated) text, taaki "Details As On" jaisi rotated date
+            # kabhi crop me na aaye.
+            region_chars = [
+                c for c in chars
+                if c["x0"] >= 300 and c.get("upright", True)
+            ]
             lines = _cluster_lines(region_chars)
 
             hindi_label_idx = None
@@ -179,8 +182,6 @@ def crop_address_images(pdf_bytes, password=None, resolution=400):
             if address_label_idx is None:
                 return None, None
 
-            # English address ke baad aadhaar number (4-4-4 digit
-            # group) wali line dhoondo — English block ka end-boundary
             for i in range(address_label_idx + 1, len(lines)):
                 t = _line_text(lines[i]).replace(" ", "")
                 if re.search(r"\d{4}\d{4}\d{4}", t):
@@ -401,10 +402,6 @@ def extract_back_data(pdf_bytes, password=None):
     if not english_address:
         english_address = "N/A"
 
-    # Kuch PDFs "पता" likhte hain, kuch "पत्ता" (doubled-त, Maharashtra
-    # style) — dono ko check karte hain. Ye text sirf "has_hindi" check
-    # aur emergency-fallback ke liye hai — asli display ab image-crop
-    # se hoti hai (neeche build_back_card_image me).
     hindi_address = None
     for i, line in enumerate(lines):
         if "पत्ता" in line or "पता" in line:
@@ -447,19 +444,37 @@ def cover_fit(img, box_w, box_h):
     return resized.crop((left, top, left + box_w, top + box_h))
 
 
-def contain_fit(img, box_w, box_h):
-    # cover_fit jaisa, lekin CROP nahi karta — poori image bina kate
-    # box ke andar fit ho jaati hai (address text ka koi hissa kabhi
-    # cut nahi hona chahiye, isliye ye "contain" style zaroori hai).
-    img_ratio = img.width / img.height
-    box_ratio = box_w / box_h
-    if img_ratio > box_ratio:
-        new_w = box_w
-        new_h = max(1, int(box_w / img_ratio))
-    else:
-        new_h = box_h
-        new_w = max(1, int(box_h * img_ratio))
-    return img.resize((new_w, new_h), Image.LANCZOS)
+def fit_pair_shared_scale(img_a, img_b, box_a, box_b):
+    """
+    Hindi aur English address crops ko ALAG-ALAG apne box me
+    "contain fit" karne se dono ka font-size mismatch ho jaata hai
+    (jiska content chhota/kam-lines wala hai wo zyada bada scale ho
+    jaata hai). Dono images SAME PDF se SAME resolution par crop hue
+    hain, isliye unka original font-size already ek jaisa hai — hume
+    bas ek hi SHARED scale factor lagana hai (jo dono ko apne-apne box
+    me fit rakhe), taaki visual size hamesha match kare.
+    """
+    box_a_w, box_a_h = box_a[2] - box_a[0], box_a[3] - box_a[1]
+    box_b_w, box_b_h = box_b[2] - box_b[0], box_b[3] - box_b[1]
+
+    scales = []
+    if img_a is not None:
+        scales.append(min(box_a_w / img_a.width, box_a_h / img_a.height))
+    if img_b is not None:
+        scales.append(min(box_b_w / img_b.width, box_b_h / img_b.height))
+
+    if not scales:
+        return img_a, img_b
+    shared_scale = min(scales)
+
+    def resize(img):
+        if img is None:
+            return None
+        new_w = max(1, int(img.width * shared_scale))
+        new_h = max(1, int(img.height * shared_scale))
+        return img.resize((new_w, new_h), Image.LANCZOS)
+
+    return resize(img_a), resize(img_b)
 
 
 def draw_centered_text(draw, box, text, font, fill="#1A2238"):
@@ -548,11 +563,6 @@ GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDE
 
 
 def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
-    # NOTE: front card sirf structured fields (naam, DOB, gender,
-    # mobile, aadhaar no, VID) use karta hai — ye sab clean/reliable
-    # tarike se text se hi extract hote hain, isliye front card
-    # scanning (text extraction) hi rehti hai, image-crop yahan
-    # zaroori nahi.
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
         raise ValueError("PDF mein se chehre wali photo nahi mil payi")
@@ -687,42 +697,58 @@ def build_back_card_image(pdf_bytes, password=None):
     label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
 
-    # Address ka image-crop (Hindi + English dono) ek hi baar nikal lo
     hindi_crop, english_crop = crop_address_images(pdf_bytes, password)
 
     if data["hindi_address"]:
         hindi_label_box = scale_box(HINDI_LABEL_BOX)
         hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
-        draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
-
-        if hindi_crop is not None:
-            box_w = hindi_addr_box[2] - hindi_addr_box[0]
-            box_h = hindi_addr_box[3] - hindi_addr_box[1]
-            fitted_hindi = contain_fit(hindi_crop, box_w, box_h)
-            template.paste(fitted_hindi, (hindi_addr_box[0], hindi_addr_box[1]))
-        else:
-            # Fallback: image-crop fail ho jaaye to purana text-draw
-            draw_wrapped_text(
-                draw, hindi_addr_box, data["hindi_address"],
-                get_font("hi", False, addr_font_size),
-                line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-            )
-
         english_label_box = scale_box(ENGLISH_LABEL_BOX)
         english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
+
+        draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
         draw_mixed_line(draw, english_label_box, [("Address:", "en")], label_font_size)
 
-        if english_crop is not None:
-            box_w = english_addr_box[2] - english_addr_box[0]
-            box_h = english_addr_box[3] - english_addr_box[1]
-            fitted_english = contain_fit(english_crop, box_w, box_h)
+        if hindi_crop is not None and english_crop is not None:
+            # Dono ko SAME shared-scale se resize karte hain, taaki
+            # font-size visually match kare
+            fitted_hindi, fitted_english = fit_pair_shared_scale(
+                hindi_crop, english_crop, hindi_addr_box, english_addr_box
+            )
+            template.paste(fitted_hindi, (hindi_addr_box[0], hindi_addr_box[1]))
             template.paste(fitted_english, (english_addr_box[0], english_addr_box[1]))
         else:
-            draw_wrapped_text(
-                draw, english_addr_box, data["english_address"],
-                get_font("en", False, addr_font_size),
-                line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-            )
+            # Fallback: koi ek ya dono crop fail ho gaye to purana text-draw
+            if hindi_crop is not None:
+                box_w = hindi_addr_box[2] - hindi_addr_box[0]
+                box_h = hindi_addr_box[3] - hindi_addr_box[1]
+                ratio = hindi_crop.width / hindi_crop.height
+                if box_w / box_h > ratio:
+                    nh, nw = box_h, int(box_h * ratio)
+                else:
+                    nw, nh = box_w, int(box_w / ratio)
+                template.paste(hindi_crop.resize((max(1, nw), max(1, nh)), Image.LANCZOS), (hindi_addr_box[0], hindi_addr_box[1]))
+            else:
+                draw_wrapped_text(
+                    draw, hindi_addr_box, data["hindi_address"],
+                    get_font("hi", False, addr_font_size),
+                    line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+                )
+
+            if english_crop is not None:
+                box_w = english_addr_box[2] - english_addr_box[0]
+                box_h = english_addr_box[3] - english_addr_box[1]
+                ratio = english_crop.width / english_crop.height
+                if box_w / box_h > ratio:
+                    nh, nw = box_h, int(box_h * ratio)
+                else:
+                    nw, nh = box_w, int(box_w / ratio)
+                template.paste(english_crop.resize((max(1, nw), max(1, nh)), Image.LANCZOS), (english_addr_box[0], english_addr_box[1]))
+            else:
+                draw_wrapped_text(
+                    draw, english_addr_box, data["english_address"],
+                    get_font("en", False, addr_font_size),
+                    line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
+                )
     else:
         only_label_box = scale_box(HINDI_LABEL_BOX)
         combined_box_raw = (HINDI_ADDRESS_BOX[0], HINDI_ADDRESS_BOX[1], ENGLISH_ADDRESS_BOX[2], ENGLISH_ADDRESS_BOX[3])
@@ -733,8 +759,12 @@ def build_back_card_image(pdf_bytes, password=None):
         if english_crop is not None:
             box_w = only_addr_box[2] - only_addr_box[0]
             box_h = only_addr_box[3] - only_addr_box[1]
-            fitted_english = contain_fit(english_crop, box_w, box_h)
-            template.paste(fitted_english, (only_addr_box[0], only_addr_box[1]))
+            ratio = english_crop.width / english_crop.height
+            if box_w / box_h > ratio:
+                nh, nw = box_h, int(box_h * ratio)
+            else:
+                nw, nh = box_w, int(box_w / ratio)
+            template.paste(english_crop.resize((max(1, nw), max(1, nh)), Image.LANCZOS), (only_addr_box[0], only_addr_box[1]))
         else:
             draw_wrapped_text(
                 draw, only_addr_box, data["english_address"],
