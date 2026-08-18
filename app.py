@@ -63,14 +63,18 @@ BACK_VERTICAL_TEXT_X1 = 46
 BACK_CONTENT_X0 = 55
 BACK_CONTENT_X1 = 670
 
-HINDI_LABEL_BOX   = (BACK_CONTENT_X0, 178, BACK_CONTENT_X1, 206)
-HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 208, BACK_CONTENT_X1, 307)
+# Address boxes ab pehle se bade hain (99pt -> ~121pt height) taaki
+# image-crop zyada bada render ho — pehle chhota reh jaata tha kyunki
+# shared-scale English address (jyada lines) ke hisaab se limit ho
+# jaata tha.
+HINDI_LABEL_BOX   = (BACK_CONTENT_X0, 175, BACK_CONTENT_X1, 198)
+HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 199, BACK_CONTENT_X1, 315)
 
-ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 321, BACK_CONTENT_X1, 349)
-ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 351, BACK_CONTENT_X1, 450)
+ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 322, BACK_CONTENT_X1, 345)
+ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 346, BACK_CONTENT_X1, 462)
 
 BACK_LABEL_FONT_SIZE = 26
-BACK_ADDRESS_FONT_SIZE = 40
+BACK_ADDRESS_FONT_SIZE = 24
 BACK_ADDRESS_LINE_GAP = 6
 
 FONT_EN_REGULAR = "times.ttf"
@@ -93,7 +97,7 @@ def fix_devanagari_spacing(text):
 
 # ============================================================
 # ADDRESS (Hindi + English) — dono ab IMAGE crop se aate hain,
-# text-draw se nahi. (Details neeche functions ke comments me.)
+# text-draw se nahi.
 # ============================================================
 def _cluster_lines(chars, gap_threshold=4.0):
     if not chars:
@@ -140,17 +144,12 @@ def crop_address_images(pdf_bytes, password=None, resolution=400):
        text ki tarah dobara type karne ki jagah, PDF se seedha IMAGE
        crop kar ke card pe paste karte hain (Hindi aur English dono).
     2. Ek hi visual "line" PDF ke andar kabhi-kabhi 2-3 alag font-runs
-       me todi hoti hai (Devanagari letters ek run, punctuation/number
-       dusra run) jinke top-position me sirf 0.2-2 point ka farak
-       hota hai. Isliye characters ko "line" me group karte waqt
-       chhoti GAP-TOLERANCE use karte hain, warna beech ki lines
-       silently kat jaati hain.
+       me todi hoti hai jinke top-position me sirf 0.2-2 point ka
+       farak hota hai — isliye characters ko "line" me group karte
+       waqt chhoti GAP-TOLERANCE use karte hain.
     3. Page par ek ROTATED ("Details As On: dd/mm/yyyy") text element
-       bhi hota hai, jiske individual (rotated) characters ka x0/top
-       kabhi-kabhi humare address-block ke bilkul paas girta hai aur
-       galti se crop me shaamil ho jaata hai. pdfplumber har character
-       par `upright` flag deta hai (rotated text ke liye False) —
-       isse explicitly exclude karte hain.
+       bhi hota hai jo galti se crop me shaamil ho sakta hai —
+       pdfplumber ke `upright` flag se explicitly exclude karte hain.
     """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
@@ -159,9 +158,6 @@ def crop_address_images(pdf_bytes, password=None, resolution=400):
             if not chars:
                 return None, None
 
-            # Right-column (address side) chars — sirf UPRIGHT (non-
-            # rotated) text, taaki "Details As On" jaisi rotated date
-            # kabhi crop me na aaye.
             region_chars = [
                 c for c in chars
                 if c["x0"] >= 300 and c.get("upright", True)
@@ -447,12 +443,11 @@ def cover_fit(img, box_w, box_h):
 def fit_pair_shared_scale(img_a, img_b, box_a, box_b):
     """
     Hindi aur English address crops ko ALAG-ALAG apne box me
-    "contain fit" karne se dono ka font-size mismatch ho jaata hai
-    (jiska content chhota/kam-lines wala hai wo zyada bada scale ho
-    jaata hai). Dono images SAME PDF se SAME resolution par crop hue
-    hain, isliye unka original font-size already ek jaisa hai — hume
-    bas ek hi SHARED scale factor lagana hai (jo dono ko apne-apne box
-    me fit rakhe), taaki visual size hamesha match kare.
+    "contain fit" karne se dono ka font-size mismatch ho jaata hai.
+    Dono images SAME PDF se SAME resolution par crop hue hain, isliye
+    unka original font-size already ek jaisa hai — hume bas ek hi
+    SHARED scale factor lagana hai, taaki visual size hamesha match
+    kare.
     """
     box_a_w, box_a_h = box_a[2] - box_a[0], box_a[3] - box_a[1]
     box_b_w, box_b_h = box_b[2] - box_b[0], box_b[3] - box_b[1]
@@ -709,15 +704,12 @@ def build_back_card_image(pdf_bytes, password=None):
         draw_mixed_line(draw, english_label_box, [("Address:", "en")], label_font_size)
 
         if hindi_crop is not None and english_crop is not None:
-            # Dono ko SAME shared-scale se resize karte hain, taaki
-            # font-size visually match kare
             fitted_hindi, fitted_english = fit_pair_shared_scale(
                 hindi_crop, english_crop, hindi_addr_box, english_addr_box
             )
             template.paste(fitted_hindi, (hindi_addr_box[0], hindi_addr_box[1]))
             template.paste(fitted_english, (english_addr_box[0], english_addr_box[1]))
         else:
-            # Fallback: koi ek ya dono crop fail ho gaye to purana text-draw
             if hindi_crop is not None:
                 box_w = hindi_addr_box[2] - hindi_addr_box[0]
                 box_h = hindi_addr_box[3] - hindi_addr_box[1]
