@@ -63,15 +63,15 @@ BACK_VERTICAL_TEXT_X1 = 46
 BACK_CONTENT_X0 = 55
 BACK_CONTENT_X1 = 670
 
-# Address boxes ab pehle se bade hain (99pt -> ~121pt height) taaki
-# image-crop zyada bada render ho — pehle chhota reh jaata tha kyunki
-# shared-scale English address (jyada lines) ke hisaab se limit ho
-# jaata tha.
-HINDI_LABEL_BOX   = (BACK_CONTENT_X0, 175, BACK_CONTENT_X1, 198)
-HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 199, BACK_CONTENT_X1, 315)
+# Address boxes ab MAXIMUM available room use karte hain (labels tight
+# kiye, gaps minimum kiye) — Aadhaar number box (485 se shuru) tak
+# jitni jagah thi, sab address ko de di. English box Hindi se bada hai
+# kyunki English address me aam taur par zyada lines hoti hain.
+HINDI_LABEL_BOX   = (BACK_CONTENT_X0, 175, BACK_CONTENT_X1, 195)
+HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 196, BACK_CONTENT_X1, 318)
 
-ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 322, BACK_CONTENT_X1, 345)
-ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 346, BACK_CONTENT_X1, 462)
+ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 322, BACK_CONTENT_X1, 344)
+ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 345, BACK_CONTENT_X1, 484)
 
 BACK_LABEL_FONT_SIZE = 26
 BACK_ADDRESS_FONT_SIZE = 24
@@ -87,18 +87,9 @@ DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
 
 
 def fix_devanagari_spacing(text):
-    # Sirf inline space/tab hi hatane hain, newline (line-breaks) kabhi
-    # nahi — warna alag-alag lines (jaise Hindi naam aur English naam,
-    # jo apni apni line par hote hain) galti se ek dusre se jud jaate
-    # hain. Sirf " " ya tab, [ \t]+, hatate hain — \n ko haath nahi
-    # lagate.
     return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
 
 
-# ============================================================
-# ADDRESS (Hindi + English) — dono ab IMAGE crop se aate hain,
-# text-draw se nahi.
-# ============================================================
 def _cluster_lines(chars, gap_threshold=4.0):
     if not chars:
         return []
@@ -134,23 +125,6 @@ def _bbox_from_lines(line_list, pad_x=3, pad_top=2, pad_bottom=2):
 
 
 def crop_address_images(pdf_bytes, password=None, resolution=400):
-    """
-    Returns (hindi_image, english_image) — dono PIL Image (RGB) ya
-    None agar us block ko reliably locate nahi kar paaye.
-
-    Diagnosis (asli PDF pe test karke confirm kiya):
-    1. Is font ka ToUnicode encoding kai jagah PERMANENTLY corrupt hai
-       (kuch matras NULL character ban jaate hain) — isliye address
-       text ki tarah dobara type karne ki jagah, PDF se seedha IMAGE
-       crop kar ke card pe paste karte hain (Hindi aur English dono).
-    2. Ek hi visual "line" PDF ke andar kabhi-kabhi 2-3 alag font-runs
-       me todi hoti hai jinke top-position me sirf 0.2-2 point ka
-       farak hota hai — isliye characters ko "line" me group karte
-       waqt chhoti GAP-TOLERANCE use karte hain.
-    3. Page par ek ROTATED ("Details As On: dd/mm/yyyy") text element
-       bhi hota hai jo galti se crop me shaamil ho sakta hai —
-       pdfplumber ke `upright` flag se explicitly exclude karte hain.
-    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
@@ -263,14 +237,6 @@ def find_issued_date(full_text):
 
 
 def detect_name_block(lines):
-    """
-    "DOB:" marker line dhoondh kar, uske turant upar wali 1-2 lines ko
-    "naam" maanta hai (1 agar sirf English hai, 2 agar Hindi+English
-    dono). Ye "To" ke turant baad wali line lene se ZYADA reliable hai,
-    kyunki address ka pehla hissa kabhi kabhi label ke bina (jaise
-    "Rahika Tola,") bhi aata hai aur naam jaisa dikh sakta hai — DOB ke
-    bilkul upar wali line hamesha naam hi hoti hai, kabhi address nahi.
-    """
     dob_idx = None
     for i, line in enumerate(lines):
         if re.search(r"DOB\s*:", line, re.IGNORECASE):
@@ -441,14 +407,6 @@ def cover_fit(img, box_w, box_h):
 
 
 def fit_pair_shared_scale(img_a, img_b, box_a, box_b):
-    """
-    Hindi aur English address crops ko ALAG-ALAG apne box me
-    "contain fit" karne se dono ka font-size mismatch ho jaata hai.
-    Dono images SAME PDF se SAME resolution par crop hue hain, isliye
-    unka original font-size already ek jaisa hai — hume bas ek hi
-    SHARED scale factor lagana hai, taaki visual size hamesha match
-    kare.
-    """
     box_a_w, box_a_h = box_a[2] - box_a[0], box_a[3] - box_a[1]
     box_b_w, box_b_h = box_b[2] - box_b[0], box_b[3] - box_b[1]
 
