@@ -28,27 +28,29 @@ VERTICAL_TEXT_X1 = 46
 CONTENT_X0 = 305
 CONTENT_X1 = 975
 
-TEXT_COL_TOP = 158
+# Naam (Hindi+English) + DOB + Gender ab EK hi image-crop se aate hain
+# (jaise back-card ka address). Ye box us crop ko host karta hai.
+FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 420)
 
-NAME_ROW_HEIGHT = 20
-LABEL_ROW_HEIGHT = 20
-
-GAP_HINDI_NAME_TO_ENGLISH_NAME = 24
-GAP_ENGLISH_NAME_TO_DOB = 24
-GAP_DOB_TO_GENDER = 24
-GAP_GENDER_TO_MOBILE = 24
+# Mobile number text hi rehta hai (extract ho ke), crop image ke
+# neeche alag se print hota hai.
+MOBILE_BOX = (CONTENT_X0, 430, CONTENT_X1, 465)
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
 
-NAME_FONT_SIZE = 34
-LABEL_FONT_SIZE = 34
 MOBILE_FONT_SIZE = 36
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 26
 ISSUED_FONT_SIZE = 20
+LABEL_FONT_SIZE = 34  # sirf text-fallback ke liye reserve
 
 PHOTO_BRIGHTNESS = 1.3
+
+# Front info-block (naam/DOB/gender) hardcoded PDF-space crop box —
+# UIDAI template me ye jagah fixed rehti hai.
+FRONT_INFO_CROP_PDF_BBOX = (130, 605, 215, 648)
+FRONT_INFO_CROP_RESOLUTION = 500
 
 # ============================================================
 # CONFIG — BACK CARD (Aadhaar)
@@ -61,15 +63,6 @@ BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
 BACK_VERTICAL_TEXT_X0 = 16
 BACK_VERTICAL_TEXT_X1 = 46
 
-# Address box ab MAXIMUM available jagah use karta hai:
-#   - Top: banner/logo section ke turant neeche
-#   - Bottom: Aadhaar number strip (y=485) se thoda upar
-#   - Left: rotated "Details As On" date column ke baad
-#   - Right: QR code se thoda pehle
-# Box FIXED rehta hai — jo bhi address aaye (chhoti ho ya lambi),
-# contain_fit() use isi box ke andar maximum size par fit karta hai:
-# chhoti address → bada text; lambi address → box ke hisaab se
-# thoda chhota text — lekin box khud kabhi nahi badalta.
 BACK_CONTENT_X0 = 55
 BACK_CONTENT_X1 = 690
 COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 145, BACK_CONTENT_X1, 482)
@@ -78,12 +71,6 @@ BACK_LABEL_FONT_SIZE = 26
 BACK_ADDRESS_FONT_SIZE = 24
 BACK_ADDRESS_LINE_GAP = 6
 
-# ============================================================
-# HARDCODED PDF-SPACE CROP BOX — address ka HINDI+ENGLISH+headings
-# wala poora block yahi se seedha crop hota hai (source PDF ke apne
-# "point" coordinates me). Asli PDF files pe test karke nikale gaye
-# hain — UIDAI ka e-Aadhaar template fixed hota hai, isliye ye
-# coordinates zyadatar PDFs par kaam karenge.
 ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
 ADDR_CROP_RESOLUTION = 500
 
@@ -101,6 +88,11 @@ def fix_devanagari_spacing(text):
 
 
 def make_white_transparent(img, threshold=245):
+    """
+    Cropped image ka safed background hata kar transparent kar deta
+    hai (PNG-style, RGBA) — taaki paste karte waqt koi white box kisi
+    aur cheez (photo, QR, etc.) ke upar overlap na kare.
+    """
     img = img.convert("RGBA")
     arr = np.array(img)
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
@@ -109,22 +101,31 @@ def make_white_transparent(img, threshold=245):
     return Image.fromarray(arr, mode="RGBA")
 
 
-def crop_combined_address_block(pdf_bytes, password=None):
+def crop_pdf_region(pdf_bytes, password, bbox, resolution):
+    """Generic helper: PDF ke ek fixed (hardcoded) region ko IMAGE
+    ke roop me crop karta hai, background transparent kar ke."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
-            bbox = ADDR_CROP_PDF_BBOX
             safe_bbox = (
                 max(0, bbox[0]), max(0, bbox[1]),
                 min(page.width, bbox[2]), min(page.height, bbox[3])
             )
             if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
                 return None
-            cropped = page.crop(safe_bbox).to_image(resolution=ADDR_CROP_RESOLUTION)
+            cropped = page.crop(safe_bbox).to_image(resolution=resolution)
             img = cropped.original.convert("RGB")
             return make_white_transparent(img)
     except Exception:
         return None
+
+
+def crop_combined_address_block(pdf_bytes, password=None):
+    return crop_pdf_region(pdf_bytes, password, ADDR_CROP_PDF_BBOX, ADDR_CROP_RESOLUTION)
+
+
+def crop_front_info_block(pdf_bytes, password=None):
+    return crop_pdf_region(pdf_bytes, password, FRONT_INFO_CROP_PDF_BBOX, FRONT_INFO_CROP_RESOLUTION)
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -252,6 +253,9 @@ def extract_front_data(pdf_bytes, password=None):
     text = extract_text_pdfium(pdf_bytes, password)
     lines = text.split("\n")
 
+    # Naam/DOB/gender ab sirf FALLBACK ke liye extract hote hain
+    # (agar image-crop kisi wajah se fail ho jaaye). Mobile number
+    # asli output me bhi text ki tarah hi print hota hai.
     hindi_name, english_name, _ = detect_name_block(lines)
 
     m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
@@ -354,12 +358,6 @@ def cover_fit(img, box_w, box_h):
 
 
 def contain_fit(img, box_w, box_h):
-    # Box hamesha FIXED rehta hai. Image ko is box ke andar MAXIMUM
-    # size par fit karte hain, aspect-ratio kabhi crop/distort kiye
-    # bina — jo bhi dimension (width ya height) pehle box ki limit
-    # chhoo le, wahi effective scale ban jaata hai. Isliye chhoti
-    # (kam-lines wali) address zyada bada dikhti hai, lambi address
-    # thoda chhota — box khud kabhi badalta nahi.
     img_ratio = img.width / img.height
     box_ratio = box_w / box_h
     if img_ratio > box_ratio:
@@ -433,26 +431,6 @@ def draw_wrapped_text(draw, box, text, font, line_gap=6, fill="#1A2238"):
         y += line_h
 
 
-def build_content_rows(has_hindi):
-    rows = []
-    cursor = TEXT_COL_TOP
-
-    if has_hindi:
-        rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + NAME_ROW_HEIGHT))
-        cursor = cursor + NAME_ROW_HEIGHT + GAP_HINDI_NAME_TO_ENGLISH_NAME
-
-    rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + NAME_ROW_HEIGHT))
-    cursor = cursor + NAME_ROW_HEIGHT + GAP_ENGLISH_NAME_TO_DOB
-
-    rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + LABEL_ROW_HEIGHT))
-    cursor = cursor + LABEL_ROW_HEIGHT + GAP_DOB_TO_GENDER
-
-    rows.append((CONTENT_X0, cursor, CONTENT_X1, cursor + LABEL_ROW_HEIGHT))
-    cursor = cursor + LABEL_ROW_HEIGHT
-
-    return rows, cursor
-
-
 GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDER": "ट्रांसजेंडर"}
 
 
@@ -501,40 +479,34 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     vy = photo_box[1] + ((photo_box[3] - photo_box[1]) - rotated.height) // 2
     template.paste(rotated, (vx, vy), rotated)
 
-    has_hindi = data["hindi_name"] != "N/A"
-    raw_rows, cursor_after_gender = build_content_rows(has_hindi)
-    rows = [scale_box(r) for r in raw_rows]
+    # Naam (Hindi+English) + DOB + Gender — ab image-crop se aate
+    # hain, top-left corner se paste (koi centering nahi)
+    info_box = scale_box(FRONT_INFO_BOX)
+    info_crop = crop_front_info_block(pdf_bytes, password)
 
-    mobile_top = cursor_after_gender + GAP_GENDER_TO_MOBILE
-    mobile_row_raw = (CONTENT_X0, mobile_top, CONTENT_X1, mobile_top + LABEL_ROW_HEIGHT)
+    if info_crop is not None:
+        box_w = info_box[2] - info_box[0]
+        box_h = info_box[3] - info_box[1]
+        fitted_info = contain_fit(info_crop, box_w, box_h)
+        template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
+    else:
+        # Fallback: text-draw agar crop fail ho jaaye
+        has_hindi = data["hindi_name"] != "N/A"
+        y = info_box[1]
+        row_h = 34
+        if has_hindi:
+            draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["hindi_name"], "hi")], int(NAME_FONT_SIZE_FALLBACK := 34))
+            y += row_h + 10
+        draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["english_name"], "en")], 34)
+        y += row_h + 10
+        draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [("जन्म तिथि/DOB: ", "hi"), (data["dob"], "en")], 34)
+        y += row_h + 10
+        gender_hi = GENDER_HI.get(data["gender"], "")
+        draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(gender_hi + "/ ", "hi"), (data["gender"], "en")], 34)
 
-    name_font_size = int(NAME_FONT_SIZE * scale_y)
-    label_font_size = int(LABEL_FONT_SIZE * scale_y)
-
-    idx = 0
-    if has_hindi:
-        draw_mixed_line(draw, rows[idx], [(data["hindi_name"], "hi")], name_font_size)
-        idx += 1
-
-    draw_mixed_line(draw, rows[idx], [(data["english_name"], "en")], name_font_size)
-    idx += 1
-
-    draw_mixed_line(
-        draw, rows[idx],
-        [("जन्म तिथि/DOB: ", "hi"), (data["dob"], "en")],
-        label_font_size
-    )
-    idx += 1
-
-    gender_hi = GENDER_HI.get(data["gender"], "")
-    draw_mixed_line(
-        draw, rows[idx],
-        [(gender_hi + "/ ", "hi"), (data["gender"], "en")],
-        label_font_size
-    )
-
+    # Mobile number — text hi rehta hai, info-crop ke NEECHE
     if print_mobile and data["mobile_number"] != "N/A":
-        mobile_box = scale_box(mobile_row_raw)
+        mobile_box = scale_box(MOBILE_BOX)
         mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
         draw_mixed_line(
             draw, mobile_box,
@@ -598,12 +570,8 @@ def build_back_card_image(pdf_bytes, password=None):
         box_w = combined_box[2] - combined_box[0]
         box_h = combined_box[3] - combined_box[1]
         fitted = contain_fit(combined_crop, box_w, box_h)
-        # Fixed box ke andar CENTER karke paste karte hain, taaki
-        # jitni bhi khaali jagah bache (chhoti address ke case me),
-        # wo dono taraf barabar dikhe, ek side chipki hui na lage.
-        paste_x = combined_box[0] + (box_w - fitted.width) // 2
-        paste_y = combined_box[1] + (box_h - fitted.height) // 2
-        template.paste(fitted, (paste_x, paste_y), fitted)
+        # Wapas TOP-LEFT corner se paste — koi centering nahi
+        template.paste(fitted, (combined_box[0], combined_box[1]), fitted)
     else:
         if data["hindi_address"]:
             hindi_box = (combined_box[0], combined_box[1], combined_box[2], combined_box[1] + (combined_box[3] - combined_box[1]) // 2 - 10)
