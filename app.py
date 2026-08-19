@@ -28,13 +28,14 @@ VERTICAL_TEXT_X1 = 46
 CONTENT_X0 = 305
 CONTENT_X1 = 975
 
-# Naam (Hindi+English) + DOB + Gender ab EK hi image-crop se aate hain
-# (jaise back-card ka address). Ye box us crop ko host karta hai.
-FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 420)
+# Naam (Hindi+English) + DOB + Gender ka image-crop box — pehle
+# bahut bada tha (155-420) jisse ye disclaimer-text aur mobile line
+# tak overflow ho raha tha. Ab height kaafi kam kar di — utni hi
+# jitni asal me 4 lines (naam-hi, naam-en, DOB, gender) ko chahiye.
+FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 300)
 
-# Mobile number text hi rehta hai (extract ho ke), crop image ke
-# neeche alag se print hota hai.
-MOBILE_BOX = (CONTENT_X0, 430, CONTENT_X1, 465)
+# Mobile number text hi rehta hai, info-crop ke turant neeche
+MOBILE_BOX = (CONTENT_X0, 308, CONTENT_X1, 340)
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
@@ -43,12 +44,10 @@ MOBILE_FONT_SIZE = 36
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 26
 ISSUED_FONT_SIZE = 20
-LABEL_FONT_SIZE = 34  # sirf text-fallback ke liye reserve
+LABEL_FONT_SIZE = 34
 
 PHOTO_BRIGHTNESS = 1.3
 
-# Front info-block (naam/DOB/gender) hardcoded PDF-space crop box —
-# UIDAI template me ye jagah fixed rehti hai.
 FRONT_INFO_CROP_PDF_BBOX = (130, 605, 215, 648)
 FRONT_INFO_CROP_RESOLUTION = 500
 
@@ -88,11 +87,6 @@ def fix_devanagari_spacing(text):
 
 
 def make_white_transparent(img, threshold=245):
-    """
-    Cropped image ka safed background hata kar transparent kar deta
-    hai (PNG-style, RGBA) — taaki paste karte waqt koi white box kisi
-    aur cheez (photo, QR, etc.) ke upar overlap na kare.
-    """
     img = img.convert("RGBA")
     arr = np.array(img)
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
@@ -102,8 +96,6 @@ def make_white_transparent(img, threshold=245):
 
 
 def crop_pdf_region(pdf_bytes, password, bbox, resolution):
-    """Generic helper: PDF ke ek fixed (hardcoded) region ko IMAGE
-    ke roop me crop karta hai, background transparent kar ke."""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
@@ -253,9 +245,6 @@ def extract_front_data(pdf_bytes, password=None):
     text = extract_text_pdfium(pdf_bytes, password)
     lines = text.split("\n")
 
-    # Naam/DOB/gender ab sirf FALLBACK ke liye extract hote hain
-    # (agar image-crop kisi wajah se fail ho jaaye). Mobile number
-    # asli output me bhi text ki tarah hi print hota hai.
     hindi_name, english_name, _ = detect_name_block(lines)
 
     m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
@@ -479,8 +468,6 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     vy = photo_box[1] + ((photo_box[3] - photo_box[1]) - rotated.height) // 2
     template.paste(rotated, (vx, vy), rotated)
 
-    # Naam (Hindi+English) + DOB + Gender — ab image-crop se aate
-    # hain, top-left corner se paste (koi centering nahi)
     info_box = scale_box(FRONT_INFO_BOX)
     info_crop = crop_front_info_block(pdf_bytes, password)
 
@@ -490,12 +477,11 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
         fitted_info = contain_fit(info_crop, box_w, box_h)
         template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
     else:
-        # Fallback: text-draw agar crop fail ho jaaye
         has_hindi = data["hindi_name"] != "N/A"
         y = info_box[1]
         row_h = 34
         if has_hindi:
-            draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["hindi_name"], "hi")], int(NAME_FONT_SIZE_FALLBACK := 34))
+            draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["hindi_name"], "hi")], 34)
             y += row_h + 10
         draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["english_name"], "en")], 34)
         y += row_h + 10
@@ -504,7 +490,6 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
         gender_hi = GENDER_HI.get(data["gender"], "")
         draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(gender_hi + "/ ", "hi"), (data["gender"], "en")], 34)
 
-    # Mobile number — text hi rehta hai, info-crop ke NEECHE
     if print_mobile and data["mobile_number"] != "N/A":
         mobile_box = scale_box(MOBILE_BOX)
         mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
@@ -570,7 +555,6 @@ def build_back_card_image(pdf_bytes, password=None):
         box_w = combined_box[2] - combined_box[0]
         box_h = combined_box[3] - combined_box[1]
         fitted = contain_fit(combined_crop, box_w, box_h)
-        # Wapas TOP-LEFT corner se paste — koi centering nahi
         template.paste(fitted, (combined_box[0], combined_box[1]), fitted)
     else:
         if data["hindi_address"]:
