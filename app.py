@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import numpy as np
 import pdfplumber
 import pypdfium2 as pdfium
 from flask import Flask, request, send_file, jsonify
@@ -63,19 +64,27 @@ BACK_VERTICAL_TEXT_X1 = 46
 BACK_CONTENT_X0 = 55
 BACK_CONTENT_X1 = 670
 
-# Address boxes ab MAXIMUM available room use karte hain (labels tight
-# kiye, gaps minimum kiye) — Aadhaar number box (485 se shuru) tak
-# jitni jagah thi, sab address ko de di. English box Hindi se bada hai
-# kyunki English address me aam taur par zyada lines hoti hain.
-HINDI_LABEL_BOX   = (BACK_CONTENT_X0, 175, BACK_CONTENT_X1, 195)
-HINDI_ADDRESS_BOX = (BACK_CONTENT_X0, 196, BACK_CONTENT_X1, 318)
-
-ENGLISH_LABEL_BOX   = (BACK_CONTENT_X0, 322, BACK_CONTENT_X1, 344)
-ENGLISH_ADDRESS_BOX = (BACK_CONTENT_X0, 345, BACK_CONTENT_X1, 484)
+# Hindi + English address ab EK hi combined image-crop me aate hain
+# (heading "पता:"/"Address:" bhi isi crop ke andar baked-in hai —
+# alag se draw nahi karni padti). Ye box QR code (right side) aur
+# Aadhaar-number strip (bottom, y=485 se shuru) se safe distance
+# par hai, taaki kabhi overlap na ho.
+COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 170, BACK_CONTENT_X1, 480)
 
 BACK_LABEL_FONT_SIZE = 26
 BACK_ADDRESS_FONT_SIZE = 24
 BACK_ADDRESS_LINE_GAP = 6
+
+# ============================================================
+# HARDCODED PDF-SPACE CROP BOX — address ka HINDI+ENGLISH+headings
+# wala poora block yahi se seedha crop hota hai (source PDF ke apne
+# "point" coordinates me, jo PDF ke pixel/canvas size se bilkul alag
+# hote hain). Ye coordinates asli PDF files pe test karke nikale gaye
+# hain — UIDAI ka e-Aadhaar template fixed hota hai, isliye ye
+# coordinates zyadatar PDFs par kaam karenge. Agar kisi PDF ka layout
+# thoda alag nikla, sirf ye 4 number badalne honge.
+ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)   # (x0, top, x1, bottom) PDF points me
+ADDR_CROP_RESOLUTION = 500                   # jitna zyada, utna sharp crop
 
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
@@ -90,94 +99,43 @@ def fix_devanagari_spacing(text):
     return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
 
 
-def _cluster_lines(chars, gap_threshold=4.0):
-    if not chars:
-        return []
-    cs = sorted(chars, key=lambda c: c["top"])
-    lines = []
-    current = [cs[0]]
-    current_min_top = cs[0]["top"]
-    for c in cs[1:]:
-        if c["top"] - current_min_top <= gap_threshold:
-            current.append(c)
-            current_min_top = min(current_min_top, c["top"])
-        else:
-            lines.append(current)
-            current = [c]
-            current_min_top = c["top"]
-    lines.append(current)
-    return lines
+def make_white_transparent(img, threshold=245):
+    """
+    Cropped address image ka safed background hata kar transparent
+    (alpha=0) kar deta hai, taaki jab isse card pe paste karein to
+    koi white box QR code ya kisi aur cheez ke upar overlap na kare —
+    sirf actual text hi dikhega.
+    """
+    img = img.convert("RGBA")
+    arr = np.array(img)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    white_mask = (r >= threshold) & (g >= threshold) & (b >= threshold)
+    arr[..., 3] = np.where(white_mask, 0, 255)
+    return Image.fromarray(arr, mode="RGBA")
 
 
-def _line_text(line_chars):
-    return "".join(c["text"] for c in sorted(line_chars, key=lambda c: c["x0"]))
-
-
-def _bbox_from_lines(line_list, pad_x=3, pad_top=2, pad_bottom=2):
-    all_chars = [c for lc in line_list for c in lc]
-    if not all_chars:
-        return None
-    x0 = min(c["x0"] for c in all_chars)
-    x1 = max(c["x1"] for c in all_chars)
-    top = min(c["top"] for c in all_chars)
-    bottom = max(c["bottom"] for c in all_chars)
-    return (x0 - pad_x, top - pad_top, x1 + pad_x, bottom + pad_bottom)
-
-
-def crop_address_images(pdf_bytes, password=None, resolution=400):
+def crop_combined_address_block(pdf_bytes, password=None):
+    """
+    Address (Hindi + English, dono ke headings samet) ko EK hardcoded
+    fixed box se crop karta hai — koi dynamic character-detection
+    nahi. Background transparent kar ke PNG (RGBA) return karta hai.
+    Fail hone par None.
+    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
-            chars = page.chars
-            if not chars:
-                return None, None
-
-            region_chars = [
-                c for c in chars
-                if c["x0"] >= 300 and c.get("upright", True)
-            ]
-            lines = _cluster_lines(region_chars)
-
-            hindi_label_idx = None
-            address_label_idx = None
-            end_idx = None
-
-            for i, lc in enumerate(lines):
-                t = _line_text(lc)
-                if hindi_label_idx is None and (("पत" in t and "आत्मज" not in t) or "आत्मज" in t):
-                    hindi_label_idx = i
-                if address_label_idx is None and "Address" in t:
-                    address_label_idx = i
-
-            if address_label_idx is None:
-                return None, None
-
-            for i in range(address_label_idx + 1, len(lines)):
-                t = _line_text(lines[i]).replace(" ", "")
-                if re.search(r"\d{4}\d{4}\d{4}", t):
-                    end_idx = i
-                    break
-            if end_idx is None:
-                end_idx = min(address_label_idx + 6, len(lines))
-
-            hindi_img = None
-            if hindi_label_idx is not None and hindi_label_idx < address_label_idx:
-                hindi_lines = lines[hindi_label_idx + 1: address_label_idx]
-                bbox = _bbox_from_lines(hindi_lines, pad_top=1, pad_bottom=1)
-                if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
-                    cropped = page.crop(bbox).to_image(resolution=resolution)
-                    hindi_img = cropped.original.convert("RGB")
-
-            english_img = None
-            english_lines = lines[address_label_idx + 1: end_idx]
-            bbox = _bbox_from_lines(english_lines, pad_top=1, pad_bottom=1)
-            if bbox and bbox[2] > bbox[0] and bbox[3] > bbox[1]:
-                cropped = page.crop(bbox).to_image(resolution=resolution)
-                english_img = cropped.original.convert("RGB")
-
-            return hindi_img, english_img
+            bbox = ADDR_CROP_PDF_BBOX
+            safe_bbox = (
+                max(0, bbox[0]), max(0, bbox[1]),
+                min(page.width, bbox[2]), min(page.height, bbox[3])
+            )
+            if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
+                return None
+            cropped = page.crop(safe_bbox).to_image(resolution=ADDR_CROP_RESOLUTION)
+            img = cropped.original.convert("RGB")
+            return make_white_transparent(img)
     except Exception:
-        return None, None
+        return None
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -406,28 +364,16 @@ def cover_fit(img, box_w, box_h):
     return resized.crop((left, top, left + box_w, top + box_h))
 
 
-def fit_pair_shared_scale(img_a, img_b, box_a, box_b):
-    box_a_w, box_a_h = box_a[2] - box_a[0], box_a[3] - box_a[1]
-    box_b_w, box_b_h = box_b[2] - box_b[0], box_b[3] - box_b[1]
-
-    scales = []
-    if img_a is not None:
-        scales.append(min(box_a_w / img_a.width, box_a_h / img_a.height))
-    if img_b is not None:
-        scales.append(min(box_b_w / img_b.width, box_b_h / img_b.height))
-
-    if not scales:
-        return img_a, img_b
-    shared_scale = min(scales)
-
-    def resize(img):
-        if img is None:
-            return None
-        new_w = max(1, int(img.width * shared_scale))
-        new_h = max(1, int(img.height * shared_scale))
-        return img.resize((new_w, new_h), Image.LANCZOS)
-
-    return resize(img_a), resize(img_b)
+def contain_fit(img, box_w, box_h):
+    img_ratio = img.width / img.height
+    box_ratio = box_w / box_h
+    if img_ratio > box_ratio:
+        new_w = box_w
+        new_h = max(1, int(box_w / img_ratio))
+    else:
+        new_h = box_h
+        new_w = max(1, int(box_h * img_ratio))
+    return img.resize((new_w, new_h), Image.LANCZOS)
 
 
 def draw_centered_text(draw, box, text, font, fill="#1A2238"):
@@ -647,80 +593,36 @@ def build_back_card_image(pdf_bytes, password=None):
     vy = (template.height - rotated.height) // 2
     template.paste(rotated, (vx, vy), rotated)
 
-    label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
+    label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
 
-    hindi_crop, english_crop = crop_address_images(pdf_bytes, password)
+    # Hardcoded combined crop — Hindi + English + dono headings ek
+    # saath, background transparent
+    combined_crop = crop_combined_address_block(pdf_bytes, password)
+    combined_box = scale_box(COMBINED_ADDRESS_BOX)
 
-    if data["hindi_address"]:
-        hindi_label_box = scale_box(HINDI_LABEL_BOX)
-        hindi_addr_box = scale_box(HINDI_ADDRESS_BOX)
-        english_label_box = scale_box(ENGLISH_LABEL_BOX)
-        english_addr_box = scale_box(ENGLISH_ADDRESS_BOX)
-
-        draw_mixed_line(draw, hindi_label_box, [("पता:", "hi")], label_font_size)
-        draw_mixed_line(draw, english_label_box, [("Address:", "en")], label_font_size)
-
-        if hindi_crop is not None and english_crop is not None:
-            fitted_hindi, fitted_english = fit_pair_shared_scale(
-                hindi_crop, english_crop, hindi_addr_box, english_addr_box
-            )
-            template.paste(fitted_hindi, (hindi_addr_box[0], hindi_addr_box[1]))
-            template.paste(fitted_english, (english_addr_box[0], english_addr_box[1]))
-        else:
-            if hindi_crop is not None:
-                box_w = hindi_addr_box[2] - hindi_addr_box[0]
-                box_h = hindi_addr_box[3] - hindi_addr_box[1]
-                ratio = hindi_crop.width / hindi_crop.height
-                if box_w / box_h > ratio:
-                    nh, nw = box_h, int(box_h * ratio)
-                else:
-                    nw, nh = box_w, int(box_w / ratio)
-                template.paste(hindi_crop.resize((max(1, nw), max(1, nh)), Image.LANCZOS), (hindi_addr_box[0], hindi_addr_box[1]))
-            else:
-                draw_wrapped_text(
-                    draw, hindi_addr_box, data["hindi_address"],
-                    get_font("hi", False, addr_font_size),
-                    line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-                )
-
-            if english_crop is not None:
-                box_w = english_addr_box[2] - english_addr_box[0]
-                box_h = english_addr_box[3] - english_addr_box[1]
-                ratio = english_crop.width / english_crop.height
-                if box_w / box_h > ratio:
-                    nh, nw = box_h, int(box_h * ratio)
-                else:
-                    nw, nh = box_w, int(box_w / ratio)
-                template.paste(english_crop.resize((max(1, nw), max(1, nh)), Image.LANCZOS), (english_addr_box[0], english_addr_box[1]))
-            else:
-                draw_wrapped_text(
-                    draw, english_addr_box, data["english_address"],
-                    get_font("en", False, addr_font_size),
-                    line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-                )
+    if combined_crop is not None:
+        box_w = combined_box[2] - combined_box[0]
+        box_h = combined_box[3] - combined_box[1]
+        fitted = contain_fit(combined_crop, box_w, box_h)
+        # RGBA image ko uske apne alpha-channel ko hi mask ki tarah
+        # use karke paste karte hain — jahan transparent hai wahan
+        # template ka background hi dikhega, koi white box nahi.
+        template.paste(fitted, (combined_box[0], combined_box[1]), fitted)
     else:
-        only_label_box = scale_box(HINDI_LABEL_BOX)
-        combined_box_raw = (HINDI_ADDRESS_BOX[0], HINDI_ADDRESS_BOX[1], ENGLISH_ADDRESS_BOX[2], ENGLISH_ADDRESS_BOX[3])
-        only_addr_box = scale_box(combined_box_raw)
-
-        draw_mixed_line(draw, only_label_box, [("Address:", "en")], label_font_size)
-
-        if english_crop is not None:
-            box_w = only_addr_box[2] - only_addr_box[0]
-            box_h = only_addr_box[3] - only_addr_box[1]
-            ratio = english_crop.width / english_crop.height
-            if box_w / box_h > ratio:
-                nh, nw = box_h, int(box_h * ratio)
-            else:
-                nw, nh = box_w, int(box_w / ratio)
-            template.paste(english_crop.resize((max(1, nw), max(1, nh)), Image.LANCZOS), (only_addr_box[0], only_addr_box[1]))
+        # Fallback: agar hardcoded crop kisi wajah se fail ho jaaye
+        # (bahut rare — bbox page se bahar chala jaaye waghera), to
+        # purana text-draw use kar lo taaki card khaali na jaaye
+        if data["hindi_address"]:
+            hindi_box = (combined_box[0], combined_box[1], combined_box[2], combined_box[1] + (combined_box[3] - combined_box[1]) // 2 - 10)
+            english_box = (combined_box[0], hindi_box[3] + 20, combined_box[2], combined_box[3])
+            draw_mixed_line(draw, (combined_box[0], combined_box[1] - 25, combined_box[2], combined_box[1] - 3), [("पता:", "hi")], label_font_size)
+            draw_wrapped_text(draw, hindi_box, data["hindi_address"], get_font("hi", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
+            draw_mixed_line(draw, (english_box[0], english_box[1] - 25, english_box[2], english_box[1] - 3), [("Address:", "en")], label_font_size)
+            draw_wrapped_text(draw, english_box, data["english_address"], get_font("en", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
         else:
-            draw_wrapped_text(
-                draw, only_addr_box, data["english_address"],
-                get_font("en", False, addr_font_size),
-                line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y)
-            )
+            draw_mixed_line(draw, (combined_box[0], combined_box[1] - 25, combined_box[2], combined_box[1] - 3), [("Address:", "en")], label_font_size)
+            draw_wrapped_text(draw, combined_box, data["english_address"], get_font("en", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     draw_centered_text(
