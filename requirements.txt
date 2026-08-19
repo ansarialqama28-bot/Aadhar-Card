@@ -3,4 +3,5 @@ flask-cors
 pdfplumber
 pillow
 pypdfium2
+numpy
 gunicorn
