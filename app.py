@@ -61,15 +61,18 @@ BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
 BACK_VERTICAL_TEXT_X0 = 16
 BACK_VERTICAL_TEXT_X1 = 46
 
+# Address box ab MAXIMUM available jagah use karta hai:
+#   - Top: banner/logo section ke turant neeche
+#   - Bottom: Aadhaar number strip (y=485) se thoda upar
+#   - Left: rotated "Details As On" date column ke baad
+#   - Right: QR code se thoda pehle
+# Box FIXED rehta hai — jo bhi address aaye (chhoti ho ya lambi),
+# contain_fit() use isi box ke andar maximum size par fit karta hai:
+# chhoti address → bada text; lambi address → box ke hisaab se
+# thoda chhota text — lekin box khud kabhi nahi badalta.
 BACK_CONTENT_X0 = 55
-BACK_CONTENT_X1 = 670
-
-# Hindi + English address ab EK hi combined image-crop me aate hain
-# (heading "पता:"/"Address:" bhi isi crop ke andar baked-in hai —
-# alag se draw nahi karni padti). Ye box QR code (right side) aur
-# Aadhaar-number strip (bottom, y=485 se shuru) se safe distance
-# par hai, taaki kabhi overlap na ho.
-COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 170, BACK_CONTENT_X1, 480)
+BACK_CONTENT_X1 = 690
+COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 145, BACK_CONTENT_X1, 482)
 
 BACK_LABEL_FONT_SIZE = 26
 BACK_ADDRESS_FONT_SIZE = 24
@@ -78,13 +81,11 @@ BACK_ADDRESS_LINE_GAP = 6
 # ============================================================
 # HARDCODED PDF-SPACE CROP BOX — address ka HINDI+ENGLISH+headings
 # wala poora block yahi se seedha crop hota hai (source PDF ke apne
-# "point" coordinates me, jo PDF ke pixel/canvas size se bilkul alag
-# hote hain). Ye coordinates asli PDF files pe test karke nikale gaye
+# "point" coordinates me). Asli PDF files pe test karke nikale gaye
 # hain — UIDAI ka e-Aadhaar template fixed hota hai, isliye ye
-# coordinates zyadatar PDFs par kaam karenge. Agar kisi PDF ka layout
-# thoda alag nikla, sirf ye 4 number badalne honge.
-ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)   # (x0, top, x1, bottom) PDF points me
-ADDR_CROP_RESOLUTION = 500                   # jitna zyada, utna sharp crop
+# coordinates zyadatar PDFs par kaam karenge.
+ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
+ADDR_CROP_RESOLUTION = 500
 
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
@@ -100,12 +101,6 @@ def fix_devanagari_spacing(text):
 
 
 def make_white_transparent(img, threshold=245):
-    """
-    Cropped address image ka safed background hata kar transparent
-    (alpha=0) kar deta hai, taaki jab isse card pe paste karein to
-    koi white box QR code ya kisi aur cheez ke upar overlap na kare —
-    sirf actual text hi dikhega.
-    """
     img = img.convert("RGBA")
     arr = np.array(img)
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
@@ -115,12 +110,6 @@ def make_white_transparent(img, threshold=245):
 
 
 def crop_combined_address_block(pdf_bytes, password=None):
-    """
-    Address (Hindi + English, dono ke headings samet) ko EK hardcoded
-    fixed box se crop karta hai — koi dynamic character-detection
-    nahi. Background transparent kar ke PNG (RGBA) return karta hai.
-    Fail hone par None.
-    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
@@ -365,6 +354,12 @@ def cover_fit(img, box_w, box_h):
 
 
 def contain_fit(img, box_w, box_h):
+    # Box hamesha FIXED rehta hai. Image ko is box ke andar MAXIMUM
+    # size par fit karte hain, aspect-ratio kabhi crop/distort kiye
+    # bina — jo bhi dimension (width ya height) pehle box ki limit
+    # chhoo le, wahi effective scale ban jaata hai. Isliye chhoti
+    # (kam-lines wali) address zyada bada dikhti hai, lambi address
+    # thoda chhota — box khud kabhi badalta nahi.
     img_ratio = img.width / img.height
     box_ratio = box_w / box_h
     if img_ratio > box_ratio:
@@ -596,8 +591,6 @@ def build_back_card_image(pdf_bytes, password=None):
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
     label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
 
-    # Hardcoded combined crop — Hindi + English + dono headings ek
-    # saath, background transparent
     combined_crop = crop_combined_address_block(pdf_bytes, password)
     combined_box = scale_box(COMBINED_ADDRESS_BOX)
 
@@ -605,14 +598,13 @@ def build_back_card_image(pdf_bytes, password=None):
         box_w = combined_box[2] - combined_box[0]
         box_h = combined_box[3] - combined_box[1]
         fitted = contain_fit(combined_crop, box_w, box_h)
-        # RGBA image ko uske apne alpha-channel ko hi mask ki tarah
-        # use karke paste karte hain — jahan transparent hai wahan
-        # template ka background hi dikhega, koi white box nahi.
-        template.paste(fitted, (combined_box[0], combined_box[1]), fitted)
+        # Fixed box ke andar CENTER karke paste karte hain, taaki
+        # jitni bhi khaali jagah bache (chhoti address ke case me),
+        # wo dono taraf barabar dikhe, ek side chipki hui na lage.
+        paste_x = combined_box[0] + (box_w - fitted.width) // 2
+        paste_y = combined_box[1] + (box_h - fitted.height) // 2
+        template.paste(fitted, (paste_x, paste_y), fitted)
     else:
-        # Fallback: agar hardcoded crop kisi wajah se fail ho jaaye
-        # (bahut rare — bbox page se bahar chala jaaye waghera), to
-        # purana text-draw use kar lo taaki card khaali na jaaye
         if data["hindi_address"]:
             hindi_box = (combined_box[0], combined_box[1], combined_box[2], combined_box[1] + (combined_box[3] - combined_box[1]) // 2 - 10)
             english_box = (combined_box[0], hindi_box[3] + 20, combined_box[2], combined_box[3])
