@@ -39,12 +39,12 @@ FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 345)
 # 4 lines, tight-crop ka width:height ratio ~2.1 hai, box ratio
 # zyada hai isliye height-bound rehta hai: 4 lines 190 units me,
 # ~47.5 units/line — Mobile ka font bhi usi range me rakha hai.
-MOBILE_BOX = (CONTENT_X0, 353, CONTENT_X1, 400)
+MOBILE_BOX = (CONTENT_X0, 345, CONTENT_X1, 392)
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
 
-MOBILE_FONT_SIZE = 40
+MOBILE_FONT_SIZE = 30
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 26
 ISSUED_FONT_SIZE = 20
