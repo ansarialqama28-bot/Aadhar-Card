@@ -28,19 +28,23 @@ VERTICAL_TEXT_X1 = 46
 CONTENT_X0 = 305
 CONTENT_X1 = 975
 
-# Naam (Hindi+English) + DOB + Gender ka image-crop box — pehle
-# bahut bada tha (155-420) jisse ye disclaimer-text aur mobile line
-# tak overflow ho raha tha. Ab height kaafi kam kar di — utni hi
-# jitni asal me 4 lines (naam-hi, naam-en, DOB, gender) ko chahiye.
-FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 300)
+# Naam/DOB/Gender crop box — height badhayi (145 -> 190) taaki
+# "medium" size dikhe. Crop bbox bhi tight kiya hai (kam white
+# margin), isliye ab jo bhi height milegi usme text zyada dense/
+# bada render hoga.
+FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 345)
 
-# Mobile number text hi rehta hai, info-crop ke turant neeche
-MOBILE_BOX = (CONTENT_X0, 308, CONTENT_X1, 340)
+# Mobile number text hi rehta hai. Font-size ab info-crop ke render
+# hone wale effective size se match karta hai — info box height 190,
+# 4 lines, tight-crop ka width:height ratio ~2.1 hai, box ratio
+# zyada hai isliye height-bound rehta hai: 4 lines 190 units me,
+# ~47.5 units/line — Mobile ka font bhi usi range me rakha hai.
+MOBILE_BOX = (CONTENT_X0, 353, CONTENT_X1, 400)
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
 VID_BOX = (0, 536, TEMPLATE_W, 562)
 
-MOBILE_FONT_SIZE = 36
+MOBILE_FONT_SIZE = 40
 AADHAAR_FONT_SIZE = 42
 VID_FONT_SIZE = 26
 ISSUED_FONT_SIZE = 20
@@ -48,7 +52,9 @@ LABEL_FONT_SIZE = 34
 
 PHOTO_BRIGHTNESS = 1.3
 
-FRONT_INFO_CROP_PDF_BBOX = (130, 605, 215, 648)
+# Tight bbox — kam white margin, isliye text box ke andar zyada
+# "dense"/bada render hota hai
+FRONT_INFO_CROP_PDF_BBOX = (130, 608, 213, 650)
 FRONT_INFO_CROP_RESOLUTION = 500
 
 # ============================================================
@@ -541,8 +547,8 @@ def build_back_card_image(pdf_bytes, password=None):
 
     vx0 = int(BACK_VERTICAL_TEXT_X0 * scale_x)
     vx1 = int(BACK_VERTICAL_TEXT_X1 * scale_x)
-    vx = vx0 + ((vx1 - vx0) - rotated.width) // 2
     vy = (template.height - rotated.height) // 2
+    vx = vx0 + ((vx1 - vx0) - rotated.width) // 2
     template.paste(rotated, (vx, vy), rotated)
 
     addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
