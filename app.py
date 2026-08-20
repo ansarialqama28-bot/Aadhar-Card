@@ -43,102 +43,57 @@ LABEL_FONT_SIZE = 34
 
 PHOTO_BRIGHTNESS = 1.3
 
-# Front info-block (naam/DOB/gender) ka crop.
-# LEFT, TOP, RIGHT hamesha FIXED rehte hain (ye 3 side UIDAI template
-# me stable rehte hain). BOTTOM sirf ek "generous" (lambi) starting
-# window hai — asli bottom neeche diye gaye red-line detection se
-# tay hota hai, taaki jab Hindi naam na ho (3 lines ki jagah, layout
-# upar shift ho jaata hai) to neeche wala laal-border disclaimer box
-# galti se crop me na aa jaaye.
+# Front info-block (naam/DOB/gender) crop.
+# LEFT aur TOP hamesha fixed. RIGHT normally +8px badhaya jaata hai
+# (lambe naam jaise "Ravishankar Harishankar Mishra" pehle cut ho
+# rahe the). Agar PDF me Hindi naam hi nahi hai (sirf English), to
+# +10px AUR badhta hai (total +18px) — us case me content ka layout
+# thoda alag/wider hota hai.
 FRONT_INFO_CROP_LEFT = 130
 FRONT_INFO_CROP_TOP = 608
-FRONT_INFO_CROP_RIGHT = 213
-FRONT_INFO_CROP_BOTTOM_MAX = 700   # generous window, red-line detection isse chhota kar dega
+FRONT_INFO_CROP_RIGHT_BASE = 213
+FRONT_INFO_CROP_RIGHT_EXTRA_DEFAULT = 8     # hamesha itna extra
+FRONT_INFO_CROP_RIGHT_EXTRA_NO_HINDI = 10   # Hindi naam na ho to itna AUR extra
+FRONT_INFO_CROP_BOTTOM_MAX = 700
 FRONT_INFO_CROP_RESOLUTION = 500
-RED_LINE_MARGIN_PX = 8             # red line ke upar itna gap chhodenge
+RED_LINE_MARGIN_PX = 8
+
+# Back-card address crop
+BACK_TEMPLATE_FILENAME = "aadhar_template_back.jpg"
+BACK_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACK_TEMPLATE_FILENAME)
+
+BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
+
+BACK_VERTICAL_TEXT_X0 = 16
+BACK_VERTICAL_TEXT_X1 = 46
+
+BACK_CONTENT_X0 = 55
+BACK_CONTENT_X1 = 690
+COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 145, BACK_CONTENT_X1, 482)
+
+BACK_LABEL_FONT_SIZE = 26
+BACK_ADDRESS_FONT_SIZE = 24
+BACK_ADDRESS_LINE_GAP = 6
+
+ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
+ADDR_CROP_RESOLUTION = 500
+
+FONT_EN_REGULAR = "times.ttf"
+FONT_EN_BOLD = "timesbd.ttf"
+FONT_HI_REGULAR = "NotoSansDevanagari-Regular.ttf"
+FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
+
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
+PIN_END_RE = re.compile(r"-\s*\d{6}\b")
+GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDER": "ट्रांसजेंडर"}
 
 
-def detect_red_line_row(img):
-    """
-    Image (PIL RGB) ke har row ko scan karke dhoondta hai ki kahin
-    poori (ya zyadatar) width tak RED pixels to nahi — jo disclaimer
-    box ki 2px red border-line ki nishani hai. Sabse UPAR wali aisi
-    line ka row-index return karta hai, ya None agar koi nahi mili.
-    """
-    arr = np.array(img.convert("RGB"))
-    h, w, _ = arr.shape
-    r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
-
-    red_mask = (r > 150) & (g < 110) & (b < 110)
-    red_fraction_per_row = red_mask.sum(axis=1) / w
-
-    for row in range(h):
-        if red_fraction_per_row[row] > 0.5:
-            return row
-    return None
-
-
-def make_white_transparent(img, threshold=245):
-    img = img.convert("RGBA")
-    arr = np.array(img)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    white_mask = (r >= threshold) & (g >= threshold) & (b >= threshold)
-    arr[..., 3] = np.where(white_mask, 0, 255)
-    return Image.fromarray(arr, mode="RGBA")
-
-
-def crop_pdf_region(pdf_bytes, password, bbox, resolution):
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
-            page = pdf.pages[0]
-            safe_bbox = (
-                max(0, bbox[0]), max(0, bbox[1]),
-                min(page.width, bbox[2]), min(page.height, bbox[3])
-            )
-            if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
-                return None
-            cropped = page.crop(safe_bbox).to_image(resolution=resolution)
-            img = cropped.original.convert("RGB")
-            return make_white_transparent(img)
-    except Exception:
-        return None
-
-
-def crop_combined_address_block(pdf_bytes, password=None):
-    return crop_pdf_region(pdf_bytes, password, ADDR_CROP_PDF_BBOX, ADDR_CROP_RESOLUTION)
-
-
-def crop_front_info_block(pdf_bytes, password=None):
-    """
-    Naam/DOB/Gender ko crop karta hai. Left/Top/Right fixed hain,
-    Bottom red-line detection se dynamically decide hota hai.
-    """
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
-            page = pdf.pages[0]
-            generous_bbox = (
-                max(0, FRONT_INFO_CROP_LEFT),
-                max(0, FRONT_INFO_CROP_TOP),
-                min(page.width, FRONT_INFO_CROP_RIGHT),
-                min(page.height, FRONT_INFO_CROP_BOTTOM_MAX)
-            )
-            if generous_bbox[2] <= generous_bbox[0] or generous_bbox[3] <= generous_bbox[1]:
-                return None
-
-            cropped = page.crop(generous_bbox).to_image(resolution=FRONT_INFO_CROP_RESOLUTION)
-            img = cropped.original.convert("RGB")
-
-            red_row = detect_red_line_row(img)
-            if red_row is not None:
-                trim_to = max(1, red_row - RED_LINE_MARGIN_PX)
-                img = img.crop((0, 0, img.width, trim_to))
-            # Agar red line nahi mili, to poori generous crop hi
-            # use ho jaati hai (safe fallback — kabhi khaali nahi
-            # rahega, bas thoda zyada tall ho sakta hai).
-
-            return make_white_transparent(img)
-    except Exception:
-        return None
+# ============================================================
+# HELPERS — text
+# ============================================================
+def fix_devanagari_spacing(text):
+    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -155,10 +110,6 @@ def extract_text_pdfium(pdf_bytes, password=None):
     return text
 
 
-def fix_devanagari_spacing(text):
-    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
-
-
 def get_font(lang, bold, size):
     if lang == "hi":
         path = FONT_HI_BOLD if bold else FONT_HI_REGULAR
@@ -171,34 +122,6 @@ def get_font(lang, bold, size):
             return ImageFont.load_default(size=size)
         except Exception:
             return ImageFont.load_default()
-
-
-def find_face_photo_image(page):
-    candidates = []
-    for im in page.images:
-        w = im["x1"] - im["x0"]
-        h = im["bottom"] - im["top"]
-        if h <= 0 or w <= 0:
-            continue
-        ratio = w / h
-        if 0.55 <= ratio <= 0.95 and 15 <= w <= 260 and 15 <= h <= 320:
-            candidates.append((im, w * h))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda c: c[1])
-    im = candidates[0][0]
-    bbox = (im["x0"], im["top"], im["x1"], im["bottom"])
-    cropped = page.crop(bbox).to_image(resolution=400)
-    return cropped.original.convert("RGB")
-
-
-def find_issued_date(full_text):
-    m = re.search(r"issued\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return "N/A"
 
 
 def detect_name_block(lines):
@@ -259,54 +182,11 @@ def collect_labeled_block(lines, start_idx, label_pattern, stop_re):
     return re.sub(r"\s+", " ", " ".join(collected)).strip(" ,")
 
 
-PIN_END_RE = re.compile(r"-\s*\d{6}\b")
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
-
-FONT_EN_REGULAR = "times.ttf"
-FONT_EN_BOLD = "timesbd.ttf"
-FONT_HI_REGULAR = "NotoSansDevanagari-Regular.ttf"
-FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
-
-
-def extract_front_data(pdf_bytes, password=None):
-    with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
-        page = pdf.pages[0]
-        photo_img = find_face_photo_image(page)
-
-    text = extract_text_pdfium(pdf_bytes, password)
-    lines = text.split("\n")
-
-    hindi_name, english_name, _ = detect_name_block(lines)
-
-    m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
-    aadhaar_number = m.group(1) if m else "N/A"
-
-    m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
-    vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
-
-    m = re.search(r"DOB:\s*(\d{1,2}/\d{1,2}/\d{4})", text)
-    dob = m.group(1) if m else "N/A"
-
-    m = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", text, re.IGNORECASE)
-    gender = m.group(1).upper() if m else "N/A"
-
-    m = re.search(r"Mobile:\s*(\d{10})", text)
-    mobile_number = m.group(1) if m else "N/A"
-
-    issued_date = find_issued_date(text)
-
-    return {
-        "hindi_name": hindi_name,
-        "english_name": english_name,
-        "aadhaar_number": aadhaar_number,
-        "vid": vid,
-        "dob": dob,
-        "gender": gender,
-        "mobile_number": mobile_number,
-        "issued_date": issued_date,
-        "photo": photo_img,
-    }
+def find_issued_date(full_text):
+    m = re.search(r"issued\s*:\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return "N/A"
 
 
 def find_details_as_on_date(lines, full_text):
@@ -316,51 +196,114 @@ def find_details_as_on_date(lines, full_text):
     return "N/A"
 
 
-def extract_back_data(pdf_bytes, password=None):
-    text = extract_text_pdfium(pdf_bytes, password)
-    lines = text.split("\n")
+# ============================================================
+# HELPERS — image crop
+# ============================================================
+def make_white_transparent(img, threshold=245):
+    img = img.convert("RGBA")
+    arr = np.array(img)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    white_mask = (r >= threshold) & (g >= threshold) & (b >= threshold)
+    arr[..., 3] = np.where(white_mask, 0, 255)
+    return Image.fromarray(arr, mode="RGBA")
 
-    m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
-    aadhaar_number = m.group(1) if m else "N/A"
 
-    m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
-    vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
+def detect_red_line_row(img):
+    """
+    Image ke har row ko scan karke dhoondta hai ki kahin poori
+    width tak RED pixels to nahi (disclaimer box ki 2px red
+    border-line ki nishani). Sabse UPAR wali aisi line ka row-index
+    return karta hai, ya None agar koi nahi mili.
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w, _ = arr.shape
+    r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
 
-    english_address = None
-    for i, line in enumerate(lines):
-        if line.strip() == "Address:" or line.strip().startswith("Address:"):
-            candidate = collect_labeled_block(lines, i, r"Address\s*:", PIN_END_RE)
-            if candidate:
-                english_address = candidate
-            break
-    if not english_address:
-        english_address = "N/A"
+    red_mask = (r > 150) & (g < 110) & (b < 110)
+    red_fraction_per_row = red_mask.sum(axis=1) / w
 
-    hindi_address = None
-    for i, line in enumerate(lines):
-        if "पत्ता" in line or "पता" in line:
-            candidate = collect_labeled_block(lines, i, r"पत्ता\s*:?|पता\s*:?", PIN_END_RE)
-            if candidate and DEVANAGARI_RE.search(candidate):
-                hindi_address = candidate
-            break
+    for row in range(h):
+        if red_fraction_per_row[row] > 0.5:
+            return row
+    return None
 
-    if not hindi_address:
-        for i, line in enumerate(lines):
-            if "आत्मज" in line:
-                candidate = collect_labeled_block(lines, i, r"^", PIN_END_RE)
-                if candidate and DEVANAGARI_RE.search(candidate):
-                    hindi_address = candidate
-                break
 
-    details_as_on = find_details_as_on_date(lines, text)
+def crop_pdf_region(pdf_bytes, password, bbox, resolution):
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+            safe_bbox = (
+                max(0, bbox[0]), max(0, bbox[1]),
+                min(page.width, bbox[2]), min(page.height, bbox[3])
+            )
+            if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
+                return None
+            cropped = page.crop(safe_bbox).to_image(resolution=resolution)
+            img = cropped.original.convert("RGB")
+            return make_white_transparent(img)
+    except Exception:
+        return None
 
-    return {
-        "hindi_address": hindi_address,
-        "english_address": english_address,
-        "aadhaar_number": aadhaar_number,
-        "vid": vid,
-        "details_as_on": details_as_on,
-    }
+
+def crop_combined_address_block(pdf_bytes, password=None):
+    return crop_pdf_region(pdf_bytes, password, ADDR_CROP_PDF_BBOX, ADDR_CROP_RESOLUTION)
+
+
+def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
+    """
+    Naam/DOB/Gender ko crop karta hai.
+    - LEFT/TOP fixed.
+    - RIGHT = base + 8px hamesha, + 10px AUR agar Hindi naam nahi hai.
+    - BOTTOM: red-line detection se dynamically decide hota hai.
+    """
+    right = FRONT_INFO_CROP_RIGHT_BASE + FRONT_INFO_CROP_RIGHT_EXTRA_DEFAULT
+    if not has_hindi_name:
+        right += FRONT_INFO_CROP_RIGHT_EXTRA_NO_HINDI
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+            generous_bbox = (
+                max(0, FRONT_INFO_CROP_LEFT),
+                max(0, FRONT_INFO_CROP_TOP),
+                min(page.width, right),
+                min(page.height, FRONT_INFO_CROP_BOTTOM_MAX)
+            )
+            if generous_bbox[2] <= generous_bbox[0] or generous_bbox[3] <= generous_bbox[1]:
+                return None
+
+            cropped = page.crop(generous_bbox).to_image(resolution=FRONT_INFO_CROP_RESOLUTION)
+            img = cropped.original.convert("RGB")
+
+            red_row = detect_red_line_row(img)
+            if red_row is not None:
+                trim_to = max(1, red_row - RED_LINE_MARGIN_PX)
+                img = img.crop((0, 0, img.width, trim_to))
+
+            return make_white_transparent(img)
+    except Exception:
+        return None
+
+
+def find_face_photo_image(page):
+    candidates = []
+    for im in page.images:
+        w = im["x1"] - im["x0"]
+        h = im["bottom"] - im["top"]
+        if h <= 0 or w <= 0:
+            continue
+        ratio = w / h
+        if 0.55 <= ratio <= 0.95 and 15 <= w <= 260 and 15 <= h <= 320:
+            candidates.append((im, w * h))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: c[1])
+    im = candidates[0][0]
+    bbox = (im["x0"], im["top"], im["x1"], im["bottom"])
+    cropped = page.crop(bbox).to_image(resolution=400)
+    return cropped.original.convert("RGB")
 
 
 def cover_fit(img, box_w, box_h):
@@ -452,9 +395,99 @@ def draw_wrapped_text(draw, box, text, font, line_gap=6, fill="#1A2238"):
         y += line_h
 
 
-GENDER_HI = {"MALE": "पुरुष", "FEMALE": "महिला", "TRANSGENDER": "ट्रांसजेंडर"}
+# ============================================================
+# DATA EXTRACTION
+# ============================================================
+def extract_front_data(pdf_bytes, password=None):
+    with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+        page = pdf.pages[0]
+        photo_img = find_face_photo_image(page)
+
+    text = extract_text_pdfium(pdf_bytes, password)
+    lines = text.split("\n")
+
+    hindi_name, english_name, _ = detect_name_block(lines)
+
+    m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
+    aadhaar_number = m.group(1) if m else "N/A"
+
+    m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
+    vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
+
+    m = re.search(r"DOB:\s*(\d{1,2}/\d{1,2}/\d{4})", text)
+    dob = m.group(1) if m else "N/A"
+
+    m = re.search(r"\b(MALE|FEMALE|TRANSGENDER)\b", text, re.IGNORECASE)
+    gender = m.group(1).upper() if m else "N/A"
+
+    m = re.search(r"Mobile:\s*(\d{10})", text)
+    mobile_number = m.group(1) if m else "N/A"
+
+    issued_date = find_issued_date(text)
+
+    return {
+        "hindi_name": hindi_name,
+        "english_name": english_name,
+        "aadhaar_number": aadhaar_number,
+        "vid": vid,
+        "dob": dob,
+        "gender": gender,
+        "mobile_number": mobile_number,
+        "issued_date": issued_date,
+        "photo": photo_img,
+    }
 
 
+def extract_back_data(pdf_bytes, password=None):
+    text = extract_text_pdfium(pdf_bytes, password)
+    lines = text.split("\n")
+
+    m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
+    aadhaar_number = m.group(1) if m else "N/A"
+
+    m = re.search(r"VID\s*:?\s*([\d ]{15,30}\d)", text)
+    vid = re.sub(r"\s+", " ", m.group(1)).strip() if m else "N/A"
+
+    english_address = None
+    for i, line in enumerate(lines):
+        if line.strip() == "Address:" or line.strip().startswith("Address:"):
+            candidate = collect_labeled_block(lines, i, r"Address\s*:", PIN_END_RE)
+            if candidate:
+                english_address = candidate
+            break
+    if not english_address:
+        english_address = "N/A"
+
+    hindi_address = None
+    for i, line in enumerate(lines):
+        if "पत्ता" in line or "पता" in line:
+            candidate = collect_labeled_block(lines, i, r"पत्ता\s*:?|पता\s*:?", PIN_END_RE)
+            if candidate and DEVANAGARI_RE.search(candidate):
+                hindi_address = candidate
+            break
+
+    if not hindi_address:
+        for i, line in enumerate(lines):
+            if "आत्मज" in line:
+                candidate = collect_labeled_block(lines, i, r"^", PIN_END_RE)
+                if candidate and DEVANAGARI_RE.search(candidate):
+                    hindi_address = candidate
+                break
+
+    details_as_on = find_details_as_on_date(lines, text)
+
+    return {
+        "hindi_address": hindi_address,
+        "english_address": english_address,
+        "aadhaar_number": aadhaar_number,
+        "vid": vid,
+        "details_as_on": details_as_on,
+    }
+
+
+# ============================================================
+# CARD BUILDERS
+# ============================================================
 def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
@@ -500,8 +533,10 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     vy = photo_box[1] + ((photo_box[3] - photo_box[1]) - rotated.height) // 2
     template.paste(rotated, (vx, vy), rotated)
 
+    has_hindi = data["hindi_name"] != "N/A"
+
     info_box = scale_box(FRONT_INFO_BOX)
-    info_crop = crop_front_info_block(pdf_bytes, password)
+    info_crop = crop_front_info_block(pdf_bytes, password, has_hindi_name=has_hindi)
 
     if info_crop is not None:
         box_w = info_box[2] - info_box[0]
@@ -509,7 +544,6 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
         fitted_info = contain_fit(info_crop, box_w, box_h)
         template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
     else:
-        has_hindi = data["hindi_name"] != "N/A"
         y = info_box[1]
         row_h = 34
         if has_hindi:
@@ -615,26 +649,9 @@ def build_back_card_image(pdf_bytes, password=None):
     return template
 
 
-BACK_TEMPLATE_FILENAME = "aadhar_template_back.jpg"
-BACK_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACK_TEMPLATE_FILENAME)
-
-BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
-
-BACK_VERTICAL_TEXT_X0 = 16
-BACK_VERTICAL_TEXT_X1 = 46
-
-BACK_CONTENT_X0 = 55
-BACK_CONTENT_X1 = 690
-COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 145, BACK_CONTENT_X1, 482)
-
-BACK_LABEL_FONT_SIZE = 26
-BACK_ADDRESS_FONT_SIZE = 24
-BACK_ADDRESS_LINE_GAP = 6
-
-ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
-ADDR_CROP_RESOLUTION = 500
-
-
+# ============================================================
+# ROUTES
+# ============================================================
 @app.route("/generate-card", methods=["POST"])
 def generate_card():
     if "pdf" not in request.files:
