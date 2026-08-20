@@ -28,17 +28,8 @@ VERTICAL_TEXT_X1 = 46
 CONTENT_X0 = 305
 CONTENT_X1 = 975
 
-# Naam/DOB/Gender crop box — height badhayi (145 -> 190) taaki
-# "medium" size dikhe. Crop bbox bhi tight kiya hai (kam white
-# margin), isliye ab jo bhi height milegi usme text zyada dense/
-# bada render hoga.
 FRONT_INFO_BOX = (CONTENT_X0, 155, CONTENT_X1, 345)
 
-# Mobile number text hi rehta hai. Font-size ab info-crop ke render
-# hone wale effective size se match karta hai — info box height 190,
-# 4 lines, tight-crop ka width:height ratio ~2.1 hai, box ratio
-# zyada hai isliye height-bound rehta hai: 4 lines 190 units me,
-# ~47.5 units/line — Mobile ka font bhi usi range me rakha hai.
 MOBILE_BOX = (CONTENT_X0 + 13, 333, CONTENT_X1, 380)
 
 AADHAAR_NUM_BOX = (0, 485, TEMPLATE_W, 533)
@@ -52,44 +43,39 @@ LABEL_FONT_SIZE = 34
 
 PHOTO_BRIGHTNESS = 1.3
 
-# Tight bbox — kam white margin, isliye text box ke andar zyada
-# "dense"/bada render hota hai
-FRONT_INFO_CROP_PDF_BBOX = (130, 608, 213, 650)
+# Front info-block (naam/DOB/gender) ka crop.
+# LEFT, TOP, RIGHT hamesha FIXED rehte hain (ye 3 side UIDAI template
+# me stable rehte hain). BOTTOM sirf ek "generous" (lambi) starting
+# window hai — asli bottom neeche diye gaye red-line detection se
+# tay hota hai, taaki jab Hindi naam na ho (3 lines ki jagah, layout
+# upar shift ho jaata hai) to neeche wala laal-border disclaimer box
+# galti se crop me na aa jaaye.
+FRONT_INFO_CROP_LEFT = 130
+FRONT_INFO_CROP_TOP = 608
+FRONT_INFO_CROP_RIGHT = 213
+FRONT_INFO_CROP_BOTTOM_MAX = 700   # generous window, red-line detection isse chhota kar dega
 FRONT_INFO_CROP_RESOLUTION = 500
-
-# ============================================================
-# CONFIG — BACK CARD (Aadhaar)
-# ============================================================
-BACK_TEMPLATE_FILENAME = "aadhar_template_back.jpg"
-BACK_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACK_TEMPLATE_FILENAME)
-
-BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
-
-BACK_VERTICAL_TEXT_X0 = 16
-BACK_VERTICAL_TEXT_X1 = 46
-
-BACK_CONTENT_X0 = 55
-BACK_CONTENT_X1 = 690
-COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 145, BACK_CONTENT_X1, 482)
-
-BACK_LABEL_FONT_SIZE = 26
-BACK_ADDRESS_FONT_SIZE = 24
-BACK_ADDRESS_LINE_GAP = 6
-
-ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
-ADDR_CROP_RESOLUTION = 500
-
-FONT_EN_REGULAR = "times.ttf"
-FONT_EN_BOLD = "timesbd.ttf"
-FONT_HI_REGULAR = "NotoSansDevanagari-Regular.ttf"
-FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
-
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
+RED_LINE_MARGIN_PX = 8             # red line ke upar itna gap chhodenge
 
 
-def fix_devanagari_spacing(text):
-    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
+def detect_red_line_row(img):
+    """
+    Image (PIL RGB) ke har row ko scan karke dhoondta hai ki kahin
+    poori (ya zyadatar) width tak RED pixels to nahi — jo disclaimer
+    box ki 2px red border-line ki nishani hai. Sabse UPAR wali aisi
+    line ka row-index return karta hai, ya None agar koi nahi mili.
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w, _ = arr.shape
+    r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
+
+    red_mask = (r > 150) & (g < 110) & (b < 110)
+    red_fraction_per_row = red_mask.sum(axis=1) / w
+
+    for row in range(h):
+        if red_fraction_per_row[row] > 0.5:
+            return row
+    return None
 
 
 def make_white_transparent(img, threshold=245):
@@ -123,7 +109,36 @@ def crop_combined_address_block(pdf_bytes, password=None):
 
 
 def crop_front_info_block(pdf_bytes, password=None):
-    return crop_pdf_region(pdf_bytes, password, FRONT_INFO_CROP_PDF_BBOX, FRONT_INFO_CROP_RESOLUTION)
+    """
+    Naam/DOB/Gender ko crop karta hai. Left/Top/Right fixed hain,
+    Bottom red-line detection se dynamically decide hota hai.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+            generous_bbox = (
+                max(0, FRONT_INFO_CROP_LEFT),
+                max(0, FRONT_INFO_CROP_TOP),
+                min(page.width, FRONT_INFO_CROP_RIGHT),
+                min(page.height, FRONT_INFO_CROP_BOTTOM_MAX)
+            )
+            if generous_bbox[2] <= generous_bbox[0] or generous_bbox[3] <= generous_bbox[1]:
+                return None
+
+            cropped = page.crop(generous_bbox).to_image(resolution=FRONT_INFO_CROP_RESOLUTION)
+            img = cropped.original.convert("RGB")
+
+            red_row = detect_red_line_row(img)
+            if red_row is not None:
+                trim_to = max(1, red_row - RED_LINE_MARGIN_PX)
+                img = img.crop((0, 0, img.width, trim_to))
+            # Agar red line nahi mili, to poori generous crop hi
+            # use ho jaati hai (safe fallback — kabhi khaali nahi
+            # rahega, bas thoda zyada tall ho sakta hai).
+
+            return make_white_transparent(img)
+    except Exception:
+        return None
 
 
 def extract_text_pdfium(pdf_bytes, password=None):
@@ -138,6 +153,10 @@ def extract_text_pdfium(pdf_bytes, password=None):
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     text = fix_devanagari_spacing(text)
     return text
+
+
+def fix_devanagari_spacing(text):
+    return re.sub(r"([\u093E-\u094C\u0900-\u0903\u094D])[ \t]+", r"\1", text)
 
 
 def get_font(lang, bold, size):
@@ -241,6 +260,13 @@ def collect_labeled_block(lines, start_idx, label_pattern, stop_re):
 
 
 PIN_END_RE = re.compile(r"-\s*\d{6}\b")
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+DEVANAGARI_MATRA_VIRAMA_RE = re.compile(r"[\u093E-\u094C\u0900-\u0903\u094D]")
+
+FONT_EN_REGULAR = "times.ttf"
+FONT_EN_BOLD = "timesbd.ttf"
+FONT_HI_REGULAR = "NotoSansDevanagari-Regular.ttf"
+FONT_HI_BOLD = "NotoSansDevanagari-Bold.ttf"
 
 
 def extract_front_data(pdf_bytes, password=None):
@@ -587,6 +613,26 @@ def build_back_card_image(pdf_bytes, password=None):
     )
 
     return template
+
+
+BACK_TEMPLATE_FILENAME = "aadhar_template_back.jpg"
+BACK_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACK_TEMPLATE_FILENAME)
+
+BACK_TEMPLATE_W, BACK_TEMPLATE_H = 1016, 638
+
+BACK_VERTICAL_TEXT_X0 = 16
+BACK_VERTICAL_TEXT_X1 = 46
+
+BACK_CONTENT_X0 = 55
+BACK_CONTENT_X1 = 690
+COMBINED_ADDRESS_BOX = (BACK_CONTENT_X0, 145, BACK_CONTENT_X1, 482)
+
+BACK_LABEL_FONT_SIZE = 26
+BACK_ADDRESS_FONT_SIZE = 24
+BACK_ADDRESS_LINE_GAP = 6
+
+ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
+ADDR_CROP_RESOLUTION = 500
 
 
 @app.route("/generate-card", methods=["POST"])
