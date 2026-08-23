@@ -78,7 +78,7 @@ ADDR_CROP_RESOLUTION = 500
 # NAHI kiya jaata, kyunki uske andar UIDAI ka digital signature hota
 # hai jo hum khud bana hi nahi sakte). PDF me QR ka bbox uski apni
 # "point" coordinates me — asli PDF pe test karke nikala gaya hai.
-QR_CROP_PDF_BBOX = (461.4, 601.6, 558.5, 696.5)
+QR_CROP_PDF_BBOX = (465, 601.6, 558.5, 696.5)
 QR_CROP_RESOLUTION = 600  # high-res taaki scan karne layak sharp rahe
 
 # Card (template-space, 1016x638) pe QR kahan aur kितna bada dikhega —
