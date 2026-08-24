@@ -74,16 +74,11 @@ BACK_ADDRESS_LINE_GAP = 6
 ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
 ADDR_CROP_RESOLUTION = 500
 
-# QR code — ab REAL QR seedha PDF se crop hoke aata hai (regenerate
-# NAHI kiya jaata, kyunki uske andar UIDAI ka digital signature hota
-# hai jo hum khud bana hi nahi sakte). PDF me QR ka bbox uski apni
-# "point" coordinates me — asli PDF pe test karke nikala gaya hai.
+# QR code — real, PDF se seedha crop hoke aata hai (regenerate nahi
+# hota, kyunki uske andar UIDAI ka digitally-signed data hota hai)
 QR_CROP_PDF_BBOX = (461.4, 601.6, 558.5, 696.5)
-QR_CROP_RESOLUTION = 600  # high-res taaki scan karne layak sharp rahe
+QR_CROP_RESOLUTION = 600
 
-# Card (template-space, 1016x638) pe QR kahan aur kितna bada dikhega —
-# real Aadhaar card jaisi hi jagah aur size (fine/maheen pattern,
-# bada-bada nahi)
 BACK_QR_BOX = (700, 180, 985, 460)
 
 FONT_EN_REGULAR = "times.ttf"
@@ -133,13 +128,26 @@ def get_font(lang, bold, size):
 
 
 def extract_aadhaar_number(text):
+    """
+    Aadhaar number ko dono format me support karta hai:
+    1. Unmasked: poore 12 digits, jaise "7111 9373 9991"
+    2. Masked: pehle 8 characters "X" (ya "x") hote hain, aakhri
+       me 4 real digits — jaise "XXXX XXXX 1234".
+
+    Masked wale ke liye robust regex use kiya hai — PDF font ke
+    metrics kabhi-kabhi X characters ke BEECH me bhi stray space
+    daal dete hain (jaisa Hindi text me dekha tha), isliye
+    "(?:[Xx]\\s*){8}" pattern har X ke turant baad OPTIONAL space
+    allow karta hai — chahe PDF "XXXX XXXX", "XXXXXXXX", ya
+    "X X X X X X X X" kisi bhi tarah se de, sab match ho jaayega.
+    """
     m = re.search(r"\b(\d{4}\s\d{4}\s\d{4})\b", text)
     if m:
         return re.sub(r"\s+", " ", m.group(1)).strip()
 
-    m = re.search(r"\b([Xx]{4})\s*([Xx]{4})\s*(\d{3,4})\b", text)
+    m = re.search(r"((?:[Xx]\s*){8})\s*(\d{4})\b", text)
     if m:
-        return f"{m.group(1).upper()} {m.group(2).upper()} {m.group(3)}"
+        return f"XXXX XXXX {m.group(2)}"
 
     return "N/A"
 
@@ -294,16 +302,6 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
 
 
 def crop_real_qr_image(pdf_bytes, password=None):
-    """
-    REAL QR code ko seedha PDF se crop karta hai (regenerate nahi
-    karta) — kyunki us QR ke andar UIDAI ka digitally-signed data
-    hota hai jo hum khud bana hi nahi sakte. Yahi hubahu wahi QR hai
-    jo asli PDF me scan karne par saari details dikhata hai.
-
-    QR ke liye background transparent NAHI karte (photo/QR jaise
-    images ko jaisa-hai-waisa rakhna chahiye, warna scanning fail
-    ho sakti hai) — seedha RGB image return karta hai.
-    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
@@ -667,7 +665,6 @@ def build_back_card_image(pdf_bytes, password=None):
             draw_mixed_line(draw, (combined_box[0], combined_box[1] - 25, combined_box[2], combined_box[1] - 3), [("Address:", "en")], label_font_size)
             draw_wrapped_text(draw, combined_box, data["english_address"], get_font("en", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
 
-    # ---------- REAL QR CODE (PDF se seedha crop, regenerate nahi) ----------
     qr_crop = crop_real_qr_image(pdf_bytes, password)
     qr_box = scale_box(BACK_QR_BOX)
     if qr_crop is not None:
