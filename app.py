@@ -79,7 +79,16 @@ ADDR_CROP_RESOLUTION = 500
 QR_CROP_PDF_BBOX = (461.4, 601.6, 558.5, 696.5)
 QR_CROP_RESOLUTION = 600
 
-BACK_QR_BOX = (685, 165, 1000, 475)
+BACK_QR_BOX = (700, 180, 985, 460)
+
+# ============================================================
+# CONFIG — A4 PRINT LAYOUT
+# ============================================================
+A4_DPI = 300
+A4_WIDTH_PX = int(8.27 * A4_DPI)
+A4_HEIGHT_PX = int(11.69 * A4_DPI)
+PRINT_CARD_GAP_PX = 60          # front aur back card ke beech gap
+PRINT_CROP_MARK_LEN = 18        # corner crop-marks ki length (cutting guide ke liye)
 
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
@@ -689,6 +698,42 @@ def build_back_card_image(pdf_bytes, password=None):
 
 
 # ============================================================
+# A4 PRINT PAGE BUILDER
+# ============================================================
+def build_print_pdf_page(front_img, back_img):
+    """
+    Front aur back card ko ek A4 sheet par unke asli (CR-80) size mein,
+    ek doosre ke neeche center karke rakhta hai — print karke seedha
+    cut kiya ja sake, isliye har card ke 4 corners par chhote
+    crop-marks (cutting guide lines) bhi bana diye hain.
+    """
+    a4 = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
+    draw = ImageDraw.Draw(a4)
+
+    card_w, card_h = front_img.width, front_img.height
+    total_h = card_h * 2 + PRINT_CARD_GAP_PX
+    x = (A4_WIDTH_PX - card_w) // 2
+    y_front = (A4_HEIGHT_PX - total_h) // 2
+    y_back = y_front + card_h + PRINT_CARD_GAP_PX
+
+    a4.paste(front_img.convert("RGB"), (x, y_front))
+    a4.paste(back_img.convert("RGB"), (x, y_back))
+
+    corners = [
+        (x, y_front), (x + card_w, y_front),
+        (x, y_front + card_h), (x + card_w, y_front + card_h),
+        (x, y_back), (x + card_w, y_back),
+        (x, y_back + card_h), (x + card_w, y_back + card_h),
+    ]
+    m = PRINT_CROP_MARK_LEN
+    for (cx, cy) in corners:
+        draw.line([(cx - m, cy), (cx + m, cy)], fill="black", width=1)
+        draw.line([(cx, cy - m), (cx, cy + m)], fill="black", width=1)
+
+    return a4
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 @app.route("/generate-card", methods=["POST"])
@@ -736,6 +781,33 @@ def generate_card_back():
     template.save(output, format="PNG")
     output.seek(0)
     return send_file(output, mimetype="image/png", as_attachment=False, download_name="aadhaar-card-back.png")
+
+
+@app.route("/generate-print-pdf", methods=["POST"])
+def generate_print_pdf():
+    if "pdf" not in request.files:
+        return jsonify({"error": "PDF file is required (field name: pdf)"}), 400
+
+    password = request.form.get("password", "").strip()
+    print_mobile = request.form.get("print_mobile", "no").strip().lower() == "yes"
+    pdf_file = request.files["pdf"]
+    pdf_bytes = pdf_file.read()
+
+    try:
+        front = build_front_card_image(pdf_bytes, password, print_mobile)
+        back = build_back_card_image(pdf_bytes, password)
+        page = build_print_pdf_page(front, back)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
+        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not generate the print PDF: {str(e)}"}), 500
+
+    output = io.BytesIO()
+    page.save(output, format="PDF", resolution=float(A4_DPI))
+    output.seek(0)
+    return send_file(output, mimetype="application/pdf", as_attachment=False, download_name="aadhaar-card-print.pdf")
 
 
 @app.route("/", methods=["GET"])
