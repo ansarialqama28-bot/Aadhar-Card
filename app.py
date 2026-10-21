@@ -82,6 +82,8 @@ ADDR_CROP_RESOLUTION = 500
 # hota, kyunki uske andar UIDAI ka digitally-signed data hota hai)
 QR_CROP_PDF_BBOX = (461.4, 601.6, 558.5, 696.5)
 QR_CROP_RESOLUTION = 600
+QR_MIN_RATIO, QR_MAX_RATIO = 0.9, 1.1   # square image = QR
+QR_MIN_SIZE_PT = 50                     # isse chhoti square images (logo/icon) ignore
 
 BACK_QR_BOX = (700, 180, 985, 460)
 
@@ -395,11 +397,71 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
         return None
 
 
+def find_qr_bbox_from_images(page):
+    """
+    PDF ke embedded images me se square wali (QR) image dhoondhta hai.
+    Photo (portrait ratio) aur chhote logos ignore hote hain.
+    Return: (x0, top, x1, bottom) ya None.
+    """
+    candidates = []
+    for im in page.images:
+        w = im["x1"] - im["x0"]
+        h = im["bottom"] - im["top"]
+        if w <= 0 or h <= 0:
+            continue
+        ratio = w / h
+        if QR_MIN_RATIO <= ratio <= QR_MAX_RATIO and w >= QR_MIN_SIZE_PT and h >= QR_MIN_SIZE_PT:
+            candidates.append((im, w * h))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    im = candidates[0][0]
+    return (im["x0"], im["top"], im["x1"], im["bottom"])
+
+
+def squarify_ink(img, bg_threshold=200, quiet_ratio=0.04):
+    """
+    Image me dark pixels (QR modules) ka tight bbox nikaal kar, usko
+    perfect square banata hai (quiet-zone padding ke saath). Bahar ka
+    koi text/line crop me nahi aata kyunki sirf ink-bbox ke andar ka
+    square liya jata hai.
+    """
+    arr = np.array(img.convert("L"))
+    ink = arr < bg_threshold
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return img
+    l, r = int(cols[0]), int(cols[-1]) + 1
+    t, b = int(rows[0]), int(rows[-1]) + 1
+    side = max(r - l, b - t)
+    pad = int(side * quiet_ratio)
+    side += 2 * pad
+    cx, cy = (l + r) // 2, (t + b) // 2
+    x0, y0 = cx - side // 2, cy - side // 2
+    canvas = Image.new("RGB", (side, side), "white")
+    src_box = (max(0, x0), max(0, y0), min(img.width, x0 + side), min(img.height, y0 + side))
+    piece = img.convert("RGB").crop(src_box)
+    canvas.paste(piece, (src_box[0] - x0, src_box[1] - y0))
+    return canvas
+
+
 def crop_real_qr_image(pdf_bytes, password=None):
+    """
+    QR ko auto-detect karke sirf QR crop karta hai (real QR, regenerate
+    nahi — kyunki usme UIDAI ka signed data hota hai).
+      1) PDF ke andar square image dhoondho (sabse accurate)
+      2) Na mile to purane fixed bbox ko search-area maan kar, usme se
+         QR ke dark pixels detect karke square crop
+    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
-            bbox = QR_CROP_PDF_BBOX
+
+            bbox = find_qr_bbox_from_images(page)
+            if bbox is None:
+                bbox = QR_CROP_PDF_BBOX  # fallback search area
+
             safe_bbox = (
                 max(0, bbox[0]), max(0, bbox[1]),
                 min(page.width, bbox[2]), min(page.height, bbox[3])
@@ -407,7 +469,8 @@ def crop_real_qr_image(pdf_bytes, password=None):
             if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
                 return None
             cropped = page.crop(safe_bbox).to_image(resolution=QR_CROP_RESOLUTION)
-            return cropped.original.convert("RGB")
+            img = cropped.original.convert("RGB")
+            return squarify_ink(img)
     except Exception:
         return None
 
@@ -602,4 +665,304 @@ def extract_back_data(pdf_bytes, password=None):
     details_as_on = find_details_as_on_date(lines, text)
 
     return {
-        "hind
+        "hindi_address": hindi_address,
+        "english_address": english_address,
+        "aadhaar_number": aadhaar_number,
+        "vid": vid,
+        "details_as_on": details_as_on,
+    }
+
+
+# ============================================================
+# CARD BUILDERS
+# ============================================================
+def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
+    data = extract_front_data(pdf_bytes, password)
+    if data["photo"] is None:
+        raise ValueError("PDF mein se chehre wali photo nahi mil payi")
+
+    template = Image.open(TEMPLATE_PATH).convert("RGB")
+
+    scale_x = template.width / TEMPLATE_W
+    scale_y = template.height / TEMPLATE_H
+
+    def scale_box(box):
+        x0, y0, x1, y1 = box
+        return (int(x0 * scale_x), int(y0 * scale_y), int(x1 * scale_x), int(y1 * scale_y))
+
+    draw = ImageDraw.Draw(template)
+
+    photo_box = scale_box(PHOTO_BOX)
+    pw, ph = photo_box[2] - photo_box[0], photo_box[3] - photo_box[1]
+    fitted = cover_fit(data["photo"], pw, ph)
+    fitted = ImageEnhance.Brightness(fitted).enhance(PHOTO_BRIGHTNESS)
+    template.paste(fitted, (photo_box[0], photo_box[1]))
+
+    border_w = max(2, int(PHOTO_BORDER_WIDTH * scale_x))
+    draw.rectangle(
+        [photo_box[0], photo_box[1], photo_box[2] - 1, photo_box[3] - 1],
+        outline="black", width=border_w
+    )
+
+    issued_text = f"Aadhaar No. Issued: {data['issued_date']}"
+    vfont = get_font("en", False, int(ISSUED_FONT_SIZE * scale_y))
+
+    tmp = Image.new("RGBA", (900, 70), (255, 255, 255, 0))
+    tdraw = ImageDraw.Draw(tmp)
+    tbbox = tdraw.textbbox((0, 0), issued_text, font=vfont)
+    tw, th = tbbox[2] - tbbox[0], tbbox[3] - tbbox[1]
+    tdraw.text((-tbbox[0], -tbbox[1]), issued_text, font=vfont, fill="black")
+    tmp = tmp.crop((0, 0, tw + 4, th + 4))
+    rotated = tmp.transpose(Image.ROTATE_90)
+
+    vx0 = int(VERTICAL_TEXT_X0 * scale_x)
+    vx1 = int(VERTICAL_TEXT_X1 * scale_x)
+    vx = vx0 + ((vx1 - vx0) - rotated.width) // 2
+    vy = photo_box[1] + ((photo_box[3] - photo_box[1]) - rotated.height) // 2
+    template.paste(rotated, (vx, vy), rotated)
+
+    has_hindi = data["hindi_name"] != "N/A"
+
+    info_box = scale_box(FRONT_INFO_BOX)
+    info_crop = crop_front_info_block(pdf_bytes, password, has_hindi_name=has_hindi)
+
+    if info_crop is not None:
+        box_w = info_box[2] - info_box[0]
+        box_h = info_box[3] - info_box[1]
+        fitted_info = contain_fit(info_crop, box_w, box_h)
+        template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
+    else:
+        y = info_box[1]
+        row_h = 34
+        if has_hindi:
+            draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["hindi_name"], "hi")], 34)
+            y += row_h + 10
+        draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(data["english_name"], "en")], 34)
+        y += row_h + 10
+        draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [("जन्म तिथि/DOB: ", "hi"), (data["dob"], "en")], 34)
+        y += row_h + 10
+        gender_hi = GENDER_HI.get(data["gender"], "")
+        draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(gender_hi + "/ ", "hi"), (data["gender"], "en")], 34)
+
+    if print_mobile and data["mobile_number"] != "N/A":
+        mobile_box = scale_box(MOBILE_BOX)
+        mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
+        draw_mixed_line(
+            draw, mobile_box,
+            [("Mobile No: ", "en"), (data["mobile_number"], "en")],
+            mobile_font_size
+        )
+
+    aadhaar_box = scale_box(AADHAAR_NUM_BOX)
+    draw_centered_text(
+        draw, aadhaar_box, data["aadhaar_number"],
+        get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y))
+    )
+
+    vid_box = scale_box(VID_BOX)
+    draw_centered_text(
+        draw, vid_box, f"VID: {data['vid']}",
+        get_font("en", False, int(VID_FONT_SIZE * scale_y))
+    )
+
+    return template
+
+
+def build_back_card_image(pdf_bytes, password=None):
+    data = extract_back_data(pdf_bytes, password)
+
+    template = Image.open(BACK_TEMPLATE_PATH).convert("RGB")
+
+    scale_x = template.width / BACK_TEMPLATE_W
+    scale_y = template.height / BACK_TEMPLATE_H
+
+    def scale_box(box):
+        x0, y0, x1, y1 = box
+        return (int(x0 * scale_x), int(y0 * scale_y), int(x1 * scale_x), int(y1 * scale_y))
+
+    draw = ImageDraw.Draw(template)
+
+    details_text = f"Details As On: {data['details_as_on']}"
+    vfont = get_font("en", False, int(ISSUED_FONT_SIZE * scale_y))
+
+    tmp = Image.new("RGBA", (900, 70), (255, 255, 255, 0))
+    tdraw = ImageDraw.Draw(tmp)
+    tbbox = tdraw.textbbox((0, 0), details_text, font=vfont)
+    tw, th = tbbox[2] - tbbox[0], tbbox[3] - tbbox[1]
+    tdraw.text((-tbbox[0], -tbbox[1]), details_text, font=vfont, fill="black")
+    tmp = tmp.crop((0, 0, tw + 4, th + 4))
+    rotated = tmp.transpose(Image.ROTATE_90)
+
+    vx0 = int(BACK_VERTICAL_TEXT_X0 * scale_x)
+    vx1 = int(BACK_VERTICAL_TEXT_X1 * scale_x)
+    vy = (template.height - rotated.height) // 2
+    vx = vx0 + ((vx1 - vx0) - rotated.width) // 2
+    template.paste(rotated, (vx, vy), rotated)
+
+    addr_font_size = int(BACK_ADDRESS_FONT_SIZE * scale_y)
+    label_font_size = int(BACK_LABEL_FONT_SIZE * scale_y)
+
+    combined_crop = crop_combined_address_block(pdf_bytes, password)
+    combined_box = scale_box(COMBINED_ADDRESS_BOX)
+
+    if combined_crop is not None:
+        box_w = combined_box[2] - combined_box[0]
+        box_h = combined_box[3] - combined_box[1]
+        fitted = contain_fit(combined_crop, box_w, box_h)
+        template.paste(fitted, (combined_box[0], combined_box[1]), fitted)
+    else:
+        if data["hindi_address"]:
+            hindi_box = (combined_box[0], combined_box[1], combined_box[2], combined_box[1] + (combined_box[3] - combined_box[1]) // 2 - 10)
+            english_box = (combined_box[0], hindi_box[3] + 20, combined_box[2], combined_box[3])
+            draw_mixed_line(draw, (combined_box[0], combined_box[1] - 25, combined_box[2], combined_box[1] - 3), [("पता:", "hi")], label_font_size)
+            draw_wrapped_text(draw, hindi_box, data["hindi_address"], get_font("hi", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
+            draw_mixed_line(draw, (english_box[0], english_box[1] - 25, english_box[2], english_box[1] - 3), [("Address:", "en")], label_font_size)
+            draw_wrapped_text(draw, english_box, data["english_address"], get_font("en", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
+        else:
+            draw_mixed_line(draw, (combined_box[0], combined_box[1] - 25, combined_box[2], combined_box[1] - 3), [("Address:", "en")], label_font_size)
+            draw_wrapped_text(draw, combined_box, data["english_address"], get_font("en", False, addr_font_size), line_gap=int(BACK_ADDRESS_LINE_GAP * scale_y))
+
+    qr_crop = crop_real_qr_image(pdf_bytes, password)
+    qr_box = scale_box(BACK_QR_BOX)
+    if qr_crop is not None:
+        qr_box_w = qr_box[2] - qr_box[0]
+        qr_box_h = qr_box[3] - qr_box[1]
+        fitted_qr = contain_fit(qr_crop, qr_box_w, qr_box_h)
+        template.paste(fitted_qr, (qr_box[0], qr_box[1]))
+
+    aadhaar_box = scale_box(AADHAAR_NUM_BOX)
+    draw_centered_text(
+        draw, aadhaar_box, data["aadhaar_number"],
+        get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y))
+    )
+
+    vid_box = scale_box(VID_BOX)
+    draw_centered_text(
+        draw, vid_box, f"VID: {data['vid']}",
+        get_font("en", False, int(VID_FONT_SIZE * scale_y))
+    )
+
+    return template
+
+
+# ============================================================
+# A4 PRINT PAGE BUILDER
+# ============================================================
+def build_print_pdf_page(front_img, back_img):
+    """
+    Front aur back card ko ek A4 sheet par unke asli (CR-80) size mein,
+    ek doosre ke neeche center karke rakhta hai — print karke seedha
+    cut kiya ja sake, isliye har card ke 4 corners par chhote
+    crop-marks (cutting guide lines) bhi bana diye hain.
+    """
+    a4 = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
+    draw = ImageDraw.Draw(a4)
+
+    card_w, card_h = front_img.width, front_img.height
+    total_h = card_h * 2 + PRINT_CARD_GAP_PX
+    x = (A4_WIDTH_PX - card_w) // 2
+    y_front = (A4_HEIGHT_PX - total_h) // 2
+    y_back = y_front + card_h + PRINT_CARD_GAP_PX
+
+    a4.paste(front_img.convert("RGB"), (x, y_front))
+    a4.paste(back_img.convert("RGB"), (x, y_back))
+
+    corners = [
+        (x, y_front), (x + card_w, y_front),
+        (x, y_front + card_h), (x + card_w, y_front + card_h),
+        (x, y_back), (x + card_w, y_back),
+        (x, y_back + card_h), (x + card_w, y_back + card_h),
+    ]
+    m = PRINT_CROP_MARK_LEN
+    for (cx, cy) in corners:
+        draw.line([(cx - m, cy), (cx + m, cy)], fill="black", width=1)
+        draw.line([(cx, cy - m), (cx, cy + m)], fill="black", width=1)
+
+    return a4
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+@app.route("/generate-card", methods=["POST"])
+def generate_card():
+    if "pdf" not in request.files:
+        return jsonify({"error": "PDF file is required (field name: pdf)"}), 400
+
+    password = request.form.get("password", "").strip()
+    print_mobile = request.form.get("print_mobile", "no").strip().lower() == "yes"
+    pdf_file = request.files["pdf"]
+    pdf_bytes = pdf_file.read()
+
+    try:
+        template = build_front_card_image(pdf_bytes, password, print_mobile)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
+        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not generate the card: {str(e)}"}), 500
+
+    output = io.BytesIO()
+    template.save(output, format="PNG")
+    output.seek(0)
+    return send_file(output, mimetype="image/png", as_attachment=False, download_name="aadhaar-card-front.png")
+
+
+@app.route("/generate-card-back", methods=["POST"])
+def generate_card_back():
+    if "pdf" not in request.files:
+        return jsonify({"error": "PDF file is required (field name: pdf)"}), 400
+
+    password = request.form.get("password", "").strip()
+    pdf_file = request.files["pdf"]
+    pdf_bytes = pdf_file.read()
+
+    try:
+        template = build_back_card_image(pdf_bytes, password)
+    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
+        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not generate the back card: {str(e)}"}), 500
+
+    output = io.BytesIO()
+    template.save(output, format="PNG")
+    output.seek(0)
+    return send_file(output, mimetype="image/png", as_attachment=False, download_name="aadhaar-card-back.png")
+
+
+@app.route("/generate-print-pdf", methods=["POST"])
+def generate_print_pdf():
+    if "pdf" not in request.files:
+        return jsonify({"error": "PDF file is required (field name: pdf)"}), 400
+
+    password = request.form.get("password", "").strip()
+    print_mobile = request.form.get("print_mobile", "no").strip().lower() == "yes"
+    pdf_file = request.files["pdf"]
+    pdf_bytes = pdf_file.read()
+
+    try:
+        front = build_front_card_image(pdf_bytes, password, print_mobile)
+        back = build_back_card_image(pdf_bytes, password)
+        page = build_print_pdf_page(front, back)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
+        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not generate the print PDF: {str(e)}"}), 500
+
+    output = io.BytesIO()
+    page.save(output, format="PDF", resolution=float(A4_DPI))
+    output.seek(0)
+    return send_file(output, mimetype="application/pdf", as_attachment=False, download_name="aadhaar-card-print.pdf")
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "Aadhaar Card Generator API is running"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
