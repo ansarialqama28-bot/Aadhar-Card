@@ -77,6 +77,9 @@ BACK_ADDRESS_LINE_GAP = 6
 
 ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
 ADDR_CROP_RESOLUTION = 500
+ADDR_MIN_X_PT = 250          # 'Address:' label is x se right me hi maana jayega (address column)
+ADDR_MAX_LINE_GAP_PT = 22    # lines ke beech is se bada gap = block khatam
+ADDR_CROP_PAD_PT = 2         # detected text bbox ke charon taraf padding
 
 # QR code — real, PDF se seedha crop hoke aata hai (regenerate nahi
 # hota, kyunki uske andar UIDAI ka digitally-signed data hota hai)
@@ -282,8 +285,120 @@ def crop_pdf_region(pdf_bytes, password, bbox, resolution):
         return None
 
 
+def _group_words_into_lines(words, tol=3.0):
+    """Words ko unke 'top' ke hisaab se lines me group karta hai (upar se neeche)."""
+    lines = []
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        if lines and abs(lines[-1]["top"] - w["top"]) <= tol:
+            ln = lines[-1]
+            ln["words"].append(w)
+            ln["top"] = min(ln["top"], w["top"])
+            ln["bottom"] = max(ln["bottom"], w["bottom"])
+        else:
+            lines.append({"top": w["top"], "bottom": w["bottom"], "words": [w]})
+    for ln in lines:
+        ln["text"] = " ".join(w["text"] for w in sorted(ln["words"], key=lambda w: w["x0"]))
+        ln["x0"] = min(w["x0"] for w in ln["words"])
+        ln["x1"] = max(w["x1"] for w in ln["words"])
+    return lines
+
+
+def detect_address_bbox(page):
+    """
+    Back card ka address block (Hindi + English) text detect karke dhoondhta hai.
+      - Right limit : QR ka left edge
+      - English start: "Address:" label
+      - Hindi start  : us label ke upar ki contiguous Devanagari/text lines
+      - End          : English address ki woh line jisme 6-digit PIN ho
+    Return (x0, top, x1, bottom) PDF points me, ya None.
+    """
+    qr_bbox = find_qr_bbox_from_images(page) or QR_CROP_PDF_BBOX
+    qr_left, qr_top = qr_bbox[0], qr_bbox[1]
+    right_limit = qr_left - 2
+
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+    words = [w for w in words if w["x1"] <= right_limit + 1]
+
+    labels = [w for w in words
+              if w["text"].lower().startswith("address") and w["x0"] >= ADDR_MIN_X_PT]
+    if not labels:
+        return None
+    # QR ke sabse paas (vertically) wala "Address:" label
+    label = min(labels, key=lambda w: abs(w["top"] - qr_top))
+    col_left = label["x0"] - 1
+
+    col_words = [w for w in words if w["x0"] >= col_left - 1 and w["x1"] <= right_limit + 1]
+    lines = _group_words_into_lines(col_words)
+
+    idx = next((i for i, ln in enumerate(lines) if abs(ln["top"] - label["top"]) <= 3), None)
+    if idx is None:
+        return None
+
+    # neeche: PIN wali line tak (English end)
+    end_idx = idx
+    for j in range(idx, len(lines)):
+        if j > idx and lines[j]["top"] - lines[j - 1]["bottom"] > ADDR_MAX_LINE_GAP_PT:
+            break
+        end_idx = j
+        if re.search(r"\b\d{6}\b", lines[j]["text"]):
+            break
+
+    # upar: Hindi block tak (contiguous lines)
+    start_idx = idx
+    for j in range(idx - 1, -1, -1):
+        if lines[j + 1]["top"] - lines[j]["bottom"] > ADDR_MAX_LINE_GAP_PT:
+            break
+        start_idx = j
+
+    block = lines[start_idx:end_idx + 1]
+    x0 = min(ln["x0"] for ln in block)
+    x1 = min(max(ln["x1"] for ln in block), right_limit)
+    top = block[0]["top"]
+    bottom = block[-1]["bottom"]
+    if x1 <= x0 or bottom <= top:
+        return None
+    return (x0, top, x1, bottom)
+
+
 def crop_combined_address_block(pdf_bytes, password=None):
-    return crop_pdf_region(pdf_bytes, password, ADDR_CROP_PDF_BBOX, ADDR_CROP_RESOLUTION)
+    """
+    Hindi + English address ko text-detect karke crop karta hai
+    (fixed coordinates nahi). Detect fail ho to purane fixed bbox ko
+    search-area maan kar usme se ink-tight crop leta hai.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+
+            bbox = None
+            try:
+                bbox = detect_address_bbox(page)
+            except Exception:
+                bbox = None
+
+            if bbox is not None:
+                p = ADDR_CROP_PAD_PT
+                bbox = (bbox[0] - p, bbox[1] - p, bbox[2] + p, bbox[3] + p)
+            else:
+                bbox = ADDR_CROP_PDF_BBOX
+
+            safe_bbox = (
+                max(0, bbox[0]), max(0, bbox[1]),
+                min(page.width, bbox[2]), min(page.height, bbox[3])
+            )
+            if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
+                return None
+
+            img = page.crop(safe_bbox).to_image(resolution=ADDR_CROP_RESOLUTION).original.convert("RGB")
+
+            ink = find_ink_bbox(img)
+            if ink is not None:
+                pad = FRONT_INFO_INK_PAD_PX
+                img = img.crop((max(0, ink[0] - pad), max(0, ink[1] - pad),
+                                min(img.width, ink[2] + pad), min(img.height, ink[3] + pad)))
+            return make_white_transparent(img)
+    except Exception:
+        return None
 
 
 def get_face_photo_bbox(page):
