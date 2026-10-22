@@ -116,8 +116,14 @@ BACK_QR_BOX = (700, 180, 985, 460)
 A4_DPI = 300
 A4_WIDTH_PX = int(8.27 * A4_DPI)
 A4_HEIGHT_PX = int(11.69 * A4_DPI)
-PRINT_CARD_GAP_PX = 60          # front aur back card ke beech gap
-PRINT_CROP_MARK_LEN = 18        # corner crop-marks ki length (cutting guide ke liye)
+CARD_WIDTH_MM = 85.6            # CR-80 (PVC/ATM card) asli size
+CARD_HEIGHT_MM = 53.98
+PRINT_CARD_W_PX = int(round(CARD_WIDTH_MM / 25.4 * A4_DPI))    # 1011 px @300dpi
+PRINT_CARD_H_PX = int(round(CARD_HEIGHT_MM / 25.4 * A4_DPI))   # 638 px @300dpi
+PRINT_CARD_GAP_PX = 70          # front (left) aur back (right) card ke beech gap
+PRINT_TOP_MARGIN_PX = 120       # A4 ke upar se margin (~10mm)
+PRINT_CROP_MARK_LEN = 24        # crop-mark ki length (card ke BAHAR, card par kuch nahi chhapta)
+PRINT_CROP_MARK_OFFSET = 6      # card ke kinare se crop-mark ki doori
 
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
@@ -1714,33 +1720,32 @@ def build_back_card_image(pdf_bytes, password=None):
 # ============================================================
 def build_print_pdf_page(front_img, back_img):
     """
-    Front aur back card ko ek A4 sheet par unke asli (CR-80) size mein,
-    ek doosre ke neeche center karke rakhta hai — print karke seedha
-    cut kiya ja sake, isliye har card ke 4 corners par chhote
-    crop-marks (cutting guide lines) bhi bana diye hain.
+    A4 sheet ke upar front (LEFT) aur back (RIGHT) card side by side, dono asli CR-80
+    size (85.6 x 53.98 mm @300dpi) me. Template ka pixel size kuch bhi ho, dono cards
+    isi size par laaye jaate hain, isliye print me hamesha barabar aate hain.
+    Cutting ke liye har card ke 4 corners par crop-marks card ke BAHAR bante hain.
     """
     a4 = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
     draw = ImageDraw.Draw(a4)
 
-    card_w, card_h = front_img.width, front_img.height
-    total_h = card_h * 2 + PRINT_CARD_GAP_PX
-    x = (A4_WIDTH_PX - card_w) // 2
-    y_front = (A4_HEIGHT_PX - total_h) // 2
-    y_back = y_front + card_h + PRINT_CARD_GAP_PX
+    cw, ch = PRINT_CARD_W_PX, PRINT_CARD_H_PX
+    front = front_img.convert("RGB").resize((cw, ch), Image.LANCZOS)
+    back = back_img.convert("RGB").resize((cw, ch), Image.LANCZOS)
 
-    a4.paste(front_img.convert("RGB"), (x, y_front))
-    a4.paste(back_img.convert("RGB"), (x, y_back))
+    total_w = cw * 2 + PRINT_CARD_GAP_PX
+    x_front = (A4_WIDTH_PX - total_w) // 2
+    x_back = x_front + cw + PRINT_CARD_GAP_PX
+    y = PRINT_TOP_MARGIN_PX
 
-    corners = [
-        (x, y_front), (x + card_w, y_front),
-        (x, y_front + card_h), (x + card_w, y_front + card_h),
-        (x, y_back), (x + card_w, y_back),
-        (x, y_back + card_h), (x + card_w, y_back + card_h),
-    ]
-    m = PRINT_CROP_MARK_LEN
-    for (cx, cy) in corners:
-        draw.line([(cx - m, cy), (cx + m, cy)], fill="black", width=1)
-        draw.line([(cx, cy - m), (cx, cy + m)], fill="black", width=1)
+    a4.paste(front, (x_front, y))
+    a4.paste(back, (x_back, y))
+
+    off, ln = PRINT_CROP_MARK_OFFSET, PRINT_CROP_MARK_LEN
+    for x0 in (x_front, x_back):
+        for cx, sx in ((x0, -1), (x0 + cw, 1)):          # left / right kinara
+            for cy, sy in ((y, -1), (y + ch, 1)):        # upar / neeche kinara
+                draw.line([(cx + sx * off, cy), (cx + sx * (off + ln), cy)], fill="black", width=1)
+                draw.line([(cx, cy + sy * off), (cx, cy + sy * (off + ln))], fill="black", width=1)
 
     return a4
 
