@@ -1,6 +1,8 @@
 import os
 import re
 import io
+import functools
+import threading
 import numpy as np
 import pdfplumber
 import pypdfium2 as pdfium
@@ -1427,8 +1429,25 @@ def extract_back_data(pdf_bytes, password=None):
 
 
 # ============================================================
+# PDFium thread-safe nahi hai: front aur back ki requests ek saath aane par
+# "Failed to load page" jaise random errors aate hain. Isliye PDF ka saara kaam
+# ek time par ek hi request karti hai (lock).
+# ============================================================
+_PDF_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _PDF_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+# ============================================================
 # CARD BUILDERS
 # ============================================================
+@_serialized
 def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
@@ -1600,6 +1619,7 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     return template
 
 
+@_serialized
 def build_back_card_image(pdf_bytes, password=None):
     data = extract_back_data(pdf_bytes, password)
 
