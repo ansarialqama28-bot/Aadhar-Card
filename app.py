@@ -84,6 +84,14 @@ ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
 ADDR_CROP_RESOLUTION = 500
 ADDR_MIN_X_PT = 250          # 'Address:' label is x se right me hi maana jayega (address column)
 ADDR_MAX_LINE_GAP_PT = 22    # lines ke beech is se bada gap = block khatam
+ADDR_COLUMN_MAX_WIDTH_PT = 170   # address column ki max width (card-left na mile to QR se itna peeche)
+ADDR_BAND_TOP_SLACK_PT = 12      # QR ke top se itna upar tak ka text bhi address maana jayega
+ADDR_BAND_BOTTOM_SLACK_PT = 4    # QR ke bottom se itna neeche tak (Aadhaar number line isse neeche hoti hai)
+ADDR_QR_SAFE_GAP_PT = 3          # crop ka right edge QR ke left se itna door rahega
+IMG_MODE_MIN_TEXT_CHARS = 30          # isse kam text mile to PDF "image-only" (flattened) maana jayega
+IMG_CROP_RESOLUTION = 600             # image-only PDF ke crops ka resolution
+ADDR_VERTICAL_TEXT_OFFSET_PT = 10.0   # card-left se itna aage address shuru (vertical "Details As On" ke baad)
+MOBILE_MIN_DIGIT_ASPECT = 6.2         # 10 digits ka width/height ~7.4 (6-digit PIN ~4.4): isse mobile pehchante hain
 ADDR_CROP_PAD_PT = 2         # detected text bbox ke charon taraf padding
 
 # QR code — real, PDF se seedha crop hoke aata hai (regenerate nahi
@@ -379,6 +387,73 @@ def detect_address_bbox(page):
     return (x0, top, x1, bottom)
 
 
+def find_card_left_x(page, qr_bbox):
+    """
+    Back card ke address column ka left edge: QR ke aas-paas ki card-frame images
+    (header/footer strips) me se sabse left x0. Na mile to QR se ADDR_COLUMN_MAX_WIDTH_PT peeche.
+    """
+    qr_left, qr_top, qr_bottom = qr_bbox[0], qr_bbox[1], qr_bbox[3]
+    lefts = []
+    for im in page.images:
+        w = im["x1"] - im["x0"]
+        if w < 150 or im["x0"] >= qr_left:
+            continue
+        # QR wali card-band ke aas-paas (upar-neeche 60pt) wali wide images
+        if im["bottom"] < qr_top - 60 or im["top"] > qr_bottom + 60:
+            continue
+        if im["x1"] < qr_left:      # QR ke right tak jaane wali card images hi chahiye
+            continue
+        lefts.append(im["x0"])
+    if lefts:
+        return max(min(lefts), qr_left - ADDR_COLUMN_MAX_WIDTH_PT)
+    return max(0.0, qr_left - ADDR_COLUMN_MAX_WIDTH_PT)
+
+
+def detect_address_bbox_by_band(page, qr_bbox):
+    """
+    Label par depend kiye bina: QR ke left wali vertical band (card_left .. QR_left,
+    QR_top .. QR_bottom) me jitna bhi text hai, wahi address block hai (Hindi + English).
+    Left clip / QR ki patti dono se bachata hai kyunki dono edges QR aur card-frame se aate hain.
+    """
+    qr_left, qr_top, qr_bottom = visible_qr_bbox(page, qr_bbox)[0], qr_bbox[1], qr_bbox[3]
+    card_left = find_card_left_x(page, qr_bbox)
+    band_top = qr_top - ADDR_BAND_TOP_SLACK_PT
+    band_bottom = qr_bottom + ADDR_BAND_BOTTOM_SLACK_PT
+
+    try:
+        words = page.extract_words(keep_blank_chars=False, use_text_flow=False, extra_attrs=["upright"])
+    except TypeError:
+        words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+    sel = []
+    for w in words:
+        if not w.get("upright", True):      # side ka vertical "Details As On" jaisa rotated text
+            continue
+        cy = (w["top"] + w["bottom"]) / 2.0
+        if w["x0"] < card_left - 1 or w["x1"] > qr_left - 1:
+            continue
+        if cy < band_top or cy > band_bottom:
+            continue
+        sel.append(w)
+    if not sel:
+        return None
+
+    # Upar se lagataar lines lo; bade gap par ruk jao (neeche ka Aadhaar number / VID address nahi hai)
+    lines = _group_words_into_lines(sel)
+    block = [lines[0]]
+    for ln in lines[1:]:
+        if ln["top"] - block[-1]["bottom"] > ADDR_MAX_LINE_GAP_PT:
+            break
+        block.append(ln)
+
+    x0 = min(ln["x0"] for ln in block)
+    x1 = min(max(ln["x1"] for ln in block), qr_left - ADDR_QR_SAFE_GAP_PT)
+    top = block[0]["top"]
+    bottom = max(ln["bottom"] for ln in block)
+    if x1 <= x0 or bottom <= top:
+        return None
+    return (x0, top, x1, bottom)
+
+
 def crop_combined_address_block(pdf_bytes, password=None):
     """
     Hindi + English address ko text-detect karke crop karta hai
@@ -389,17 +464,41 @@ def crop_combined_address_block(pdf_bytes, password=None):
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
 
+            qr_bbox = find_qr_bbox_from_images(page)
+            # QR ke asli (dark modules wale) left edge se pehle tak; image ka white quiet-zone address ke liye khaali jagah hai
+            qr_left_limit = (visible_qr_bbox(page, qr_bbox)[0] - ADDR_QR_SAFE_GAP_PT) if qr_bbox is not None else None
+
             bbox = None
-            try:
-                bbox = detect_address_bbox(page)
-            except Exception:
-                bbox = None
+            # 1) QR + card-frame ke beech ki band me text (label par depend nahi)
+            if qr_bbox is not None:
+                try:
+                    bbox = detect_address_bbox_by_band(page, qr_bbox)
+                except Exception:
+                    bbox = None
+            # 2) "Address:" label se
+            if bbox is None:
+                try:
+                    bbox = detect_address_bbox(page)
+                except Exception:
+                    bbox = None
 
             if bbox is not None:
                 p = ADDR_CROP_PAD_PT
                 bbox = (bbox[0] - p, bbox[1] - p, bbox[2] + p, bbox[3] + p)
             else:
-                bbox = ADDR_CROP_PDF_BBOX
+                # 3) Image-only PDF (text hi nahi): image ke ink se address dhoondo
+                if qr_bbox is not None:
+                    try:
+                        bbox = detect_address_bbox_by_ink(page, qr_bbox)
+                    except Exception:
+                        bbox = None
+                # 4) Aakhri fallback: purana fixed bbox, par QR ke andar kabhi na jaye
+                if bbox is None:
+                    bbox = ADDR_CROP_PDF_BBOX
+
+            # Kisi bhi raste se aaye, crop QR ke left edge se aage nahi ja sakta
+            if qr_left_limit is not None and bbox[2] > qr_left_limit:
+                bbox = (bbox[0], bbox[1], qr_left_limit, bbox[3])
 
             safe_bbox = (
                 max(0, bbox[0]), max(0, bbox[1]),
@@ -493,6 +592,13 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True, meta_ou
                 top = FRONT_INFO_CROP_TOP
 
             right = ADDR_CROP_PDF_BBOX[0] - 2
+            if photo_bbox is not None:
+                # card ke right me khadi separator (patli, lambi) image se aage crop na jaye
+                seps = [im["x0"] for im in page.images
+                        if (im["x1"] - im["x0"]) < 14 and (im["bottom"] - im["top"]) > 300
+                        and im["x0"] > photo_bbox[2]]
+                if seps:
+                    right = min(right, min(seps) - 1.5)
             generous_bbox = (
                 max(0, left),
                 max(0, top),
@@ -602,9 +708,42 @@ def estimate_info_meta_from_image(info_crop):
         return {}
 
 
+def merged_image_boxes(page):
+    """
+    Kuch PDFs me ek image (jaise QR) kai patti (strips) me bati hoti hai.
+    Same x-range wali, ek ke neeche ek judi hui images ko ek box me jodta hai.
+    Return: [{x0, top, x1, bottom, n}, ...]
+    """
+    groups = []
+    for im in sorted(page.images, key=lambda i: (i["top"], i["x0"])):
+        for g in groups:
+            if (abs(g["x0"] - im["x0"]) <= 1.5 and abs(g["x1"] - im["x1"]) <= 1.5
+                    and -1.5 <= im["top"] - g["bottom"] <= 1.5):
+                g["bottom"] = max(g["bottom"], im["bottom"])
+                g["n"] += 1
+                break
+        else:
+            groups.append({"x0": im["x0"], "top": im["top"], "x1": im["x1"],
+                           "bottom": im["bottom"], "n": 1})
+    return groups
+
+
+def square_image_boxes(page):
+    out = []
+    for g in merged_image_boxes(page):
+        w = g["x1"] - g["x0"]
+        h = g["bottom"] - g["top"]
+        if w <= 0 or h <= 0:
+            continue
+        if QR_MIN_RATIO <= w / h <= QR_MAX_RATIO and w >= QR_MIN_SIZE_PT and h >= QR_MIN_SIZE_PT:
+            out.append(g)
+    return out
+
+
 def find_qr_bbox_from_images(page):
     """
-    PDF ke embedded images me se square wali (QR) image dhoondhta hai.
+    PDF ke embedded images me se square wali (QR) image dhoondhta hai — chahe wo
+    ek image ho ya kai patti (strips) me bati ho.
     Photo (portrait ratio) aur chhote logos ignore hote hain.
 
     Page par ek se zyada QR-jaisi square images ho sakti hain (jaise upar
@@ -613,15 +752,7 @@ def find_qr_bbox_from_images(page):
       - warna: page me sabse neeche wali square image
     Return: (x0, top, x1, bottom) ya None.
     """
-    candidates = []
-    for im in page.images:
-        w = im["x1"] - im["x0"]
-        h = im["bottom"] - im["top"]
-        if w <= 0 or h <= 0:
-            continue
-        ratio = w / h
-        if QR_MIN_RATIO <= ratio <= QR_MAX_RATIO and w >= QR_MIN_SIZE_PT and h >= QR_MIN_SIZE_PT:
-            candidates.append(im)
+    candidates = square_image_boxes(page)
     if not candidates:
         return None
 
@@ -680,22 +811,44 @@ def extract_qr_via_pdfium(pdf_bytes, password, bbox):
     QR ki asli embedded image ko seedha PDF se nikaalta hai (page render
     nahi) — isse aas-paas ka koi text/line QR ke saath nahi aata, aur
     QR ke modules bilkul original rehte hain (scan hota rahega).
+    Agar QR kai patti (strips) me bata ho to unhe sahi jagah par jod deta hai.
     bbox: pdfplumber coords (x0, top, x1, bottom).
     """
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes), password=password or None)
     try:
         page = pdf[0]
         page_h = page.get_height()
-        best = None
+        tol = 1.5
+        inside = []
         for obj in page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]):
             l, b, r, t = obj.get_bounds()
-            top = page_h - t
-            dist = abs(l - bbox[0]) + abs(top - bbox[1]) + abs(r - bbox[2]) + abs((page_h - b) - bbox[3])
-            if best is None or dist < best[0]:
-                best = (dist, obj)
-        if best is None or best[0] > 8:
+            top, bot = page_h - t, page_h - b
+            if l >= bbox[0] - tol and r <= bbox[2] + tol and top >= bbox[1] - tol and bot <= bbox[3] + tol:
+                inside.append((top, l, r, bot, obj))
+        if not inside:
             return None
-        img = best[1].get_bitmap().to_pil().convert("RGB")
+
+        if len(inside) == 1:
+            top, l, r, bot, obj = inside[0]
+            dist = abs(l - bbox[0]) + abs(top - bbox[1]) + abs(r - bbox[2]) + abs(bot - bbox[3])
+            if dist > 8:
+                return None
+            img = obj.get_bitmap().to_pil().convert("RGB")
+        else:
+            # Strips ko unke asli pixels me ek ke neeche ek jodo (resample nahi => QR modules original)
+            inside.sort(key=lambda x: x[0])
+            bitmaps = [o[4].get_bitmap().to_pil().convert("RGB") for o in inside]
+            W = max(bm.width for bm in bitmaps)
+            norm = []
+            for bm in bitmaps:
+                if bm.width != W:
+                    bm = bm.resize((W, max(1, int(round(bm.height * W / bm.width)))), Image.NEAREST)
+                norm.append(bm)
+            img = Image.new("RGB", (W, sum(bm.height for bm in norm)), "white")
+            y = 0
+            for bm in norm:
+                img.paste(bm, (0, y))
+                y += bm.height
     finally:
         pdf.close()
 
@@ -856,6 +1009,267 @@ def draw_wrapped_text(draw, box, text, font, line_gap=6, fill="#1A2238"):
 
 
 # ============================================================
+# IMAGE-ONLY (flattened / print-to-PDF) SUPPORT
+# Kuch PDFs me koi text hota hi nahi — sab kuch images hota hai. Tab data text se nahi
+# milta, isliye sab kuch (address, number, VID, dates, mobile) page ki images me se
+# auto-detect karke seedha crop kiya jata hai (OCR/extra install ki zarurat nahi).
+# ============================================================
+def pdf_has_text(text):
+    return len(re.sub(r"\s+", "", text or "")) >= IMG_MODE_MIN_TEXT_CHARS
+
+
+def _render_bbox(page, bbox, resolution):
+    bx = (max(0, bbox[0]), max(0, bbox[1]), min(page.width, bbox[2]), min(page.height, bbox[3]))
+    if bx[2] - bx[0] < 0.5 or bx[3] - bx[1] < 0.5:
+        return None
+    return page.crop(bx).to_image(resolution=resolution).original.convert("RGB")
+
+
+def _ink_mask(img, thr=140):
+    return np.array(img.convert("L")) < thr
+
+
+def _drop_long_lines(mask, col_frac=0.85, row_frac=0.92):
+    """Region ki poori height/width tak jaane wali lines (card border, dotted/solid rules) hata do."""
+    m = mask.copy()
+    h, w = m.shape
+    if h:
+        m[:, m.sum(axis=0) >= col_frac * h] = False
+    if w:
+        m[m.sum(axis=1) >= row_frac * w, :] = False
+    return m
+
+
+def _bands(flags, min_gap):
+    """Boolean 1-D array me True ke runs; min_gap tak ke chhote gaps judte hain. -> [(start, end_inclusive)]"""
+    idx = np.where(flags)[0]
+    if idx.size == 0:
+        return []
+    out, start, prev = [], idx[0], idx[0]
+    for i in idx[1:]:
+        if i - prev > min_gap:
+            out.append((int(start), int(prev)))
+            start = i
+        prev = i
+    out.append((int(start), int(prev)))
+    return out
+
+
+def _tight_rgba(img, mask, box=None, pad=2):
+    """mask ke ink bbox par tight crop; white -> transparent."""
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return None
+    l, r = max(0, int(cols[0]) - pad), min(img.width, int(cols[-1]) + 1 + pad)
+    t, b = max(0, int(rows[0]) - pad), min(img.height, int(rows[-1]) + 1 + pad)
+    return make_white_transparent(img.crop((l, t, r, b)))
+
+
+def _wide_images_spanning(page, anchor_left, anchor_top, anchor_bottom, band=60):
+    """Anchor (photo/QR) ke upar-neeche ki card-frame images (header/footer strips) jo anchor ke x ko span karti hain."""
+    out = []
+    for im in page.images:
+        if im["x1"] - im["x0"] < 150:
+            continue
+        if not (im["x0"] < anchor_left <= im["x1"]):
+            continue
+        if im["bottom"] < anchor_top - band or im["top"] > anchor_bottom + band:
+            continue
+        out.append(im)
+    return out
+
+
+def card_header_bottom(page, anchor_left, anchor_top, anchor_bottom):
+    ims = [im for im in _wide_images_spanning(page, anchor_left, anchor_top, anchor_bottom)
+           if im["bottom"] <= anchor_top + 2]
+    return max((im["bottom"] for im in ims), default=anchor_top - 2)
+
+
+def card_footer_top(page, anchor_left, anchor_top, anchor_bottom):
+    ims = [im for im in _wide_images_spanning(page, anchor_left, anchor_top, anchor_bottom)
+           if im["top"] >= anchor_bottom - 1]
+    return min((im["top"] for im in ims), default=anchor_bottom + 35)
+
+
+def card_right_x(page, anchor_left, anchor_top, anchor_bottom):
+    ims = _wide_images_spanning(page, anchor_left, anchor_top, anchor_bottom)
+    return max((im["x1"] for im in ims), default=anchor_left + 120)
+
+
+def visible_qr_bbox(page, qr_bbox, resolution=200):
+    """QR image ke andar asli dark modules ka bbox (white quiet-zone ke bina), PDF points me."""
+    img = _render_bbox(page, qr_bbox, resolution)
+    if img is None:
+        return qr_bbox
+    m = _ink_mask(img, 200)
+    rows = np.where(m.sum(axis=1) / m.shape[1] >= QR_MIN_DENSITY)[0]
+    cols = np.where(m.sum(axis=0) / m.shape[0] >= QR_MIN_DENSITY)[0]
+    if rows.size == 0 or cols.size == 0:
+        return qr_bbox
+    k = 72.0 / resolution
+    return (qr_bbox[0] + cols[0] * k, qr_bbox[1] + rows[0] * k,
+            qr_bbox[0] + (cols[-1] + 1) * k, qr_bbox[1] + (rows[-1] + 1) * k)
+
+
+def detect_address_bbox_by_ink(page, qr_bbox):
+    """
+    Image-only PDF me address ka bbox: card-frame ke left (vertical text ke baad) se QR ke
+    left tak, header ke neeche se QR ke bottom tak jo bhi ink hai wahi address (Hindi + English).
+    """
+    vqr = visible_qr_bbox(page, qr_bbox)
+    left = find_card_left_x(page, qr_bbox) + ADDR_VERTICAL_TEXT_OFFSET_PT
+    top = card_header_bottom(page, qr_bbox[0], qr_bbox[1], qr_bbox[3]) + 0.5
+    right = vqr[0] - ADDR_QR_SAFE_GAP_PT
+    bottom = vqr[3] + 2
+    if right <= left or bottom <= top:
+        return None
+    img = _render_bbox(page, (left, top, right, bottom), IMG_CROP_RESOLUTION // 2)
+    if img is None:
+        return None
+    m = _drop_long_lines(_ink_mask(img, 150))
+    rows = np.where(m.any(axis=1))[0]
+    cols = np.where(m.any(axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return None
+    k = 72.0 / (IMG_CROP_RESOLUTION // 2)
+    return (left + cols[0] * k, top + rows[0] * k, left + (cols[-1] + 1) * k, top + (rows[-1] + 1) * k)
+
+
+def _crop_text_region(page, bbox, thr=140):
+    img = _render_bbox(page, bbox, IMG_CROP_RESOLUTION)
+    if img is None:
+        return None
+    return _tight_rgba(img, _drop_long_lines(_ink_mask(img, thr)))
+
+
+def _extract_number_and_vid(page, qr, vqr):
+    """Back card me QR ke neeche: bada Aadhaar number (pehli band) aur VID (doosri band)."""
+    left = find_card_left_x(page, qr)
+    right = card_right_x(page, qr[0], qr[1], qr[3])
+    footer = card_footer_top(page, qr[0], qr[1], qr[3])
+    bbox = (left + 2, vqr[3] + 1, right - 2, footer - 0.8)
+    img = _render_bbox(page, bbox, IMG_CROP_RESOLUTION)
+    if img is None:
+        return None, None
+    mask = _drop_long_lines(_ink_mask(img, 110))
+    k = 72.0 / IMG_CROP_RESOLUTION
+    bands = [bd for bd in _bands(mask.any(axis=1), int(0.5 / k)) if (bd[1] - bd[0] + 1) * k >= 3.0]
+    crops = []
+    for a, b in bands[:2]:
+        sub_img = img.crop((0, a, img.width, b + 1))
+        crops.append(_tight_rgba(sub_img, mask[a:b + 1, :]))
+    number = crops[0] if len(crops) >= 1 else None
+    vid = crops[1] if len(crops) >= 2 else None
+    return number, vid
+
+
+def _extract_mobile_digits(page, photo, qr):
+    """
+    Upar wale letter ke address block ki aakhri line "Mobile: XXXXXXXXXX" me se sirf digits ka
+    crop. Aakhri line me 10 digit na hon (jaise sirf PIN code) to mobile maana nahi jata.
+    """
+    letter_qrs = [g for g in square_image_boxes(page) if g["bottom"] < photo[1] - 50]
+    if not letter_qrs:
+        return None
+    lq = min(letter_qrs, key=lambda g: g["x0"])
+    left = find_card_left_x(page, (lq["x0"], lq["top"], lq["x1"], lq["bottom"]))
+    right = card_right_x(page, lq["x0"], lq["top"], lq["bottom"])
+    if right <= left + 20:
+        left, right = 0.0, lq["x1"] + 5
+    bbox = (left + 1, lq["top"] - 62, right - 1, lq["top"] - 0.3)
+    img = _render_bbox(page, bbox, IMG_CROP_RESOLUTION)
+    if img is None:
+        return None
+    mask = _drop_long_lines(_ink_mask(img, 140))
+    k = 72.0 / IMG_CROP_RESOLUTION
+    lines = [bd for bd in _bands(mask.any(axis=1), int(0.8 / k)) if (bd[1] - bd[0] + 1) * k >= 3.0]
+    if not lines:
+        return None
+    a, b = lines[-1]
+    line_mask = mask[a:b + 1, :]
+    bh = b - a + 1
+    words = _bands(line_mask.any(axis=0), max(3, int(0.22 * bh)))
+    if not words:
+        return None
+    c0, c1 = words[-1]
+    word_mask = line_mask[:, c0:c1 + 1]
+    rows = np.where(word_mask.any(axis=1))[0]
+    if rows.size == 0:
+        return None
+    digit_h = int(rows[-1] - rows[0] + 1)
+    if (c1 - c0 + 1) / max(1, digit_h) < MOBILE_MIN_DIGIT_ASPECT:
+        return None
+    sub = img.crop((c0, a, c1 + 1, b + 1))
+    return _tight_rgba(sub, word_mask)
+
+
+def extract_image_fields(pdf_bytes, password=None):
+    """
+    Image-only PDF ke liye: aadhaar number, VID, issued/details dates aur mobile digits ke
+    crops (RGBA, white transparent). Jo na mile wo dict me nahi hota.
+    """
+    out = {}
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+            photo = get_face_photo_bbox(page)
+            qr = find_qr_bbox_from_images(page)
+            if photo is None or qr is None:
+                return out
+            vqr = visible_qr_bbox(page, qr)
+
+            number, vid = _extract_number_and_vid(page, qr, vqr)
+            if number is not None:
+                out["aadhaar_img"] = number
+            if vid is not None:
+                out["vid_img"] = vid
+
+            # Front card ka vertical "Aadhaar no. issued: ..." (photo ke left)
+            f_left = find_card_left_x(page, photo)
+            f_head = card_header_bottom(page, photo[0], photo[1], photo[3])
+            issued = _crop_text_region(page, (f_left + 1.0, f_head + 0.5, photo[0] - 0.5, photo[3] + 45))
+            if issued is not None:
+                out["issued_img"] = issued
+
+            # Back card ka vertical "Details as on: ..." (card-left ke paas)
+            b_left = find_card_left_x(page, qr)
+            b_head = card_header_bottom(page, qr[0], qr[1], qr[3])
+            details = _crop_text_region(
+                page, (b_left + 1.0, b_head + 0.5, b_left + ADDR_VERTICAL_TEXT_OFFSET_PT - 0.5, vqr[3] + 2))
+            if details is not None:
+                out["details_img"] = details
+
+            mobile = _extract_mobile_digits(page, photo, qr)
+            if mobile is not None:
+                out["mobile_img"] = mobile
+    except Exception:
+        pass
+    return out
+
+
+def fit_vertical_crop(crop, sample_text, font):
+    """Rotated (neeche se upar padhne wala) date-crop ko utna bada karo jitna wahi text font me aata."""
+    tmp = Image.new("RGB", (10, 10))
+    bb = ImageDraw.Draw(tmp).textbbox((0, 0), sample_text, font=font)
+    target_len = max(1, bb[2] - bb[0])
+    s = target_len / max(1, crop.height)
+    return crop.resize((max(1, int(round(crop.width * s))), max(1, int(round(crop.height * s)))), Image.LANCZOS)
+
+
+def paste_number_image(template, img, box, font, sample="0123456789"):
+    """Aadhaar number/VID ka crop: digits ki height font ke digits jitni karke box me center karo."""
+    bb = font.getbbox(sample)
+    target_h = max(1, bb[3] - bb[1])
+    s = target_h / max(1, img.height)
+    fitted = img.resize((max(1, int(round(img.width * s))), target_h), Image.LANCZOS)
+    x0, y0, x1, y1 = box
+    px = x0 + max(((x1 - x0) - fitted.width) // 2, 0)
+    py = y0 + ((y1 - y0) - fitted.height) // 2
+    template.paste(fitted, (px, py), fitted)
+
+
+# ============================================================
 # DATA EXTRACTION
 # ============================================================
 def extract_front_data(pdf_bytes, password=None):
@@ -885,6 +1299,7 @@ def extract_front_data(pdf_bytes, password=None):
     issued_date = find_issued_date(text)
 
     return {
+        "image_mode": not pdf_has_text(text),
         "hindi_name": hindi_name,
         "english_name": english_name,
         "aadhaar_number": aadhaar_number,
@@ -935,6 +1350,7 @@ def extract_back_data(pdf_bytes, password=None):
     details_as_on = find_details_as_on_date(lines, text)
 
     return {
+        "image_mode": not pdf_has_text(text),
         "hindi_address": hindi_address,
         "english_address": english_address,
         "aadhaar_number": aadhaar_number,
@@ -950,6 +1366,8 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
         raise ValueError("PDF mein se chehre wali photo nahi mil payi")
+
+    img_fields = extract_image_fields(pdf_bytes, password) if data.get("image_mode") else {}
 
     template = Image.open(TEMPLATE_PATH).convert("RGB")
 
@@ -984,6 +1402,8 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     tdraw.text((-tbbox[0], -tbbox[1]), issued_text, font=vfont, fill="black")
     tmp = tmp.crop((0, 0, tw + 4, th + 4))
     rotated = tmp.transpose(Image.ROTATE_90)
+    if img_fields.get("issued_img") is not None:
+        rotated = fit_vertical_crop(img_fields["issued_img"], "Aadhaar No. Issued: 00/00/0000", vfont)
 
     vx0 = int(VERTICAL_TEXT_X0 * scale_x)
     vx1 = int(VERTICAL_TEXT_X1 * scale_x)
@@ -1038,42 +1458,63 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
         gender_hi = GENDER_HI.get(data["gender"], "")
         draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(gender_hi + "/ ", "hi"), (data["gender"], "en")], 34)
 
-    if print_mobile and data["mobile_number"] != "N/A":
-        mobile_text = f"Mobile No: {data['mobile_number']}"
+    mobile_img = img_fields.get("mobile_img")
+    if print_mobile and (data["mobile_number"] != "N/A" or mobile_img is not None):
         if info_fit_scale is not None and info_meta.get("font_px"):
             # Name/DOB/Gender wali lines jaisa hi font size aur wahi line-gap
             font_px = max(8, int(round(info_meta["font_px"] * info_fit_scale)))
             baseline_y = info_box[1] + int(round(
                 (info_meta["last_baseline_px"] + info_meta["pitch_px"]) * info_fit_scale))
             text_x = info_box[0] + int(round(FRONT_INFO_INK_PAD_PX * info_fit_scale))  # crop padding ke baad, baaki lines ke left se aligned
-            draw.text((text_x, baseline_y), mobile_text,
-                      font=get_font("en", False, font_px), fill="black", anchor="ls")
+            mfont = get_font("en", False, font_px)
         else:
             mobile_box = scale_box(MOBILE_BOX)
-            mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
-            draw_mixed_line(
-                draw, mobile_box,
-                [("Mobile No: ", "en"), (data["mobile_number"], "en")],
-                mobile_font_size
-            )
+            font_px = int(MOBILE_FONT_SIZE * scale_y)
+            mfont = get_font("en", False, font_px)
+            text_x = mobile_box[0]
+            baseline_y = mobile_box[1] + (mobile_box[3] - mobile_box[1]) // 2 + font_px // 3
+
+        if mobile_img is not None and data["mobile_number"] == "N/A":
+            # Image-only PDF: "Mobile No: " text + digits ka crop (digits ki height font ke digits jitni)
+            label = "Mobile No: "
+            draw.text((text_x, baseline_y), label, font=mfont, fill="black", anchor="ls")
+            lw = int(round(draw.textlength(label, font=mfont)))
+            dh = mfont.getbbox("0123456789")
+            digit_h = max(1, dh[3] - dh[1])
+            sc = digit_h / max(1, mobile_img.height)
+            dimg = mobile_img.resize((max(1, int(round(mobile_img.width * sc))), digit_h), Image.LANCZOS)
+            template.paste(dimg, (text_x + lw, baseline_y - digit_h), dimg)
+        else:
+            draw.text((text_x, baseline_y), f"Mobile No: {data['mobile_number']}",
+                      font=mfont, fill="black", anchor="ls")
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
-    draw_centered_text(
-        draw, aadhaar_box, data["aadhaar_number"],
-        get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y))
-    )
+    if img_fields.get("aadhaar_img") is not None:
+        paste_number_image(template, img_fields["aadhaar_img"], aadhaar_box,
+                           get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y)))
+    else:
+        draw_centered_text(
+            draw, aadhaar_box, data["aadhaar_number"],
+            get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y))
+        )
 
     vid_box = scale_box(VID_BOX)
-    draw_centered_text(
-        draw, vid_box, f"VID: {data['vid']}",
-        get_font("en", False, int(VID_FONT_SIZE * scale_y))
-    )
+    if img_fields.get("vid_img") is not None:
+        paste_number_image(template, img_fields["vid_img"], vid_box,
+                           get_font("en", False, int(VID_FONT_SIZE * scale_y)))
+    else:
+        draw_centered_text(
+            draw, vid_box, f"VID: {data['vid']}",
+            get_font("en", False, int(VID_FONT_SIZE * scale_y))
+        )
 
     return template
 
 
 def build_back_card_image(pdf_bytes, password=None):
     data = extract_back_data(pdf_bytes, password)
+
+    img_fields = extract_image_fields(pdf_bytes, password) if data.get("image_mode") else {}
 
     template = Image.open(BACK_TEMPLATE_PATH).convert("RGB")
 
@@ -1096,6 +1537,8 @@ def build_back_card_image(pdf_bytes, password=None):
     tdraw.text((-tbbox[0], -tbbox[1]), details_text, font=vfont, fill="black")
     tmp = tmp.crop((0, 0, tw + 4, th + 4))
     rotated = tmp.transpose(Image.ROTATE_90)
+    if img_fields.get("details_img") is not None:
+        rotated = fit_vertical_crop(img_fields["details_img"], "Details As On: 00/00/0000", vfont)
 
     vx0 = int(BACK_VERTICAL_TEXT_X0 * scale_x)
     vx1 = int(BACK_VERTICAL_TEXT_X1 * scale_x)
@@ -1135,16 +1578,24 @@ def build_back_card_image(pdf_bytes, password=None):
         template.paste(fitted_qr, (qr_box[0], qr_box[1]))
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
-    draw_centered_text(
-        draw, aadhaar_box, data["aadhaar_number"],
-        get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y))
-    )
+    if img_fields.get("aadhaar_img") is not None:
+        paste_number_image(template, img_fields["aadhaar_img"], aadhaar_box,
+                           get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y)))
+    else:
+        draw_centered_text(
+            draw, aadhaar_box, data["aadhaar_number"],
+            get_font("en", True, int(AADHAAR_FONT_SIZE * scale_y))
+        )
 
     vid_box = scale_box(VID_BOX)
-    draw_centered_text(
-        draw, vid_box, f"VID: {data['vid']}",
-        get_font("en", False, int(VID_FONT_SIZE * scale_y))
-    )
+    if img_fields.get("vid_img") is not None:
+        paste_number_image(template, img_fields["vid_img"], vid_box,
+                           get_font("en", False, int(VID_FONT_SIZE * scale_y)))
+    else:
+        draw_centered_text(
+            draw, vid_box, f"VID: {data['vid']}",
+            get_font("en", False, int(VID_FONT_SIZE * scale_y))
+        )
 
     return template
 
