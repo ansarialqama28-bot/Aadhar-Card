@@ -118,12 +118,12 @@ A4_WIDTH_PX = int(8.27 * A4_DPI)
 A4_HEIGHT_PX = int(11.69 * A4_DPI)
 CARD_WIDTH_MM = 85.6            # CR-80 (PVC/ATM card) asli size
 CARD_HEIGHT_MM = 53.98
-PRINT_CARD_W_PX = int(round(CARD_WIDTH_MM / 25.4 * A4_DPI))    # 1011 px @300dpi
-PRINT_CARD_H_PX = int(round(CARD_HEIGHT_MM / 25.4 * A4_DPI))   # 638 px @300dpi
-PRINT_CARD_GAP_PX = 70          # front (left) aur back (right) card ke beech gap
+_CR80_W_PX = int(round(CARD_WIDTH_MM / 25.4 * A4_DPI))      # 1011 px @300dpi (asli size)
+PRINT_CARD_GAP_PX = 35          # front (left) aur back (right) card ke beech gap (pehle 70 tha)
+# Gap kam hone se bachi jagah cards me jod di: dono cards thode bade (aspect ratio wahi)
+PRINT_CARD_W_PX = (2 * _CR80_W_PX + 70 - PRINT_CARD_GAP_PX) // 2
+PRINT_CARD_H_PX = int(round(PRINT_CARD_W_PX * CARD_HEIGHT_MM / CARD_WIDTH_MM))
 PRINT_TOP_MARGIN_PX = 120       # A4 ke upar se margin (~10mm)
-PRINT_CROP_MARK_LEN = 24        # crop-mark ki length (card ke BAHAR, card par kuch nahi chhapta)
-PRINT_CROP_MARK_OFFSET = 6      # card ke kinare se crop-mark ki doori
 
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
@@ -1723,11 +1723,9 @@ def build_print_pdf_page(front_img, back_img):
     A4 sheet ke upar front (LEFT) aur back (RIGHT) card side by side, dono asli CR-80
     size (85.6 x 53.98 mm @300dpi) me. Template ka pixel size kuch bhi ho, dono cards
     isi size par laaye jaate hain, isliye print me hamesha barabar aate hain.
-    Cutting ke liye har card ke 4 corners par crop-marks card ke BAHAR bante hain.
+    Koi crop-marks/lines nahi banti; sirf dono cards hote hain.
     """
     a4 = Image.new("RGB", (A4_WIDTH_PX, A4_HEIGHT_PX), "white")
-    draw = ImageDraw.Draw(a4)
-
     cw, ch = PRINT_CARD_W_PX, PRINT_CARD_H_PX
     front = front_img.convert("RGB").resize((cw, ch), Image.LANCZOS)
     back = back_img.convert("RGB").resize((cw, ch), Image.LANCZOS)
@@ -1739,13 +1737,6 @@ def build_print_pdf_page(front_img, back_img):
 
     a4.paste(front, (x_front, y))
     a4.paste(back, (x_back, y))
-
-    off, ln = PRINT_CROP_MARK_OFFSET, PRINT_CROP_MARK_LEN
-    for x0 in (x_front, x_back):
-        for cx, sx in ((x0, -1), (x0 + cw, 1)):          # left / right kinara
-            for cy, sy in ((y, -1), (y + ch, 1)):        # upar / neeche kinara
-                draw.line([(cx + sx * off, cy), (cx + sx * (off + ln), cy)], fill="black", width=1)
-                draw.line([(cx, cy + sy * off), (cx, cy + sy * (off + ln))], fill="black", width=1)
 
     return a4
 
