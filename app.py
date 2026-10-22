@@ -141,13 +141,23 @@ def get_font(lang, bold, size):
         path = FONT_HI_BOLD if bold else FONT_HI_REGULAR
     else:
         path = FONT_EN_BOLD if bold else FONT_EN_REGULAR
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
+    candidates = [path]
+    if lang != "hi":
+        # Times na mile to usi jaise serif fonts (PDF me LiberationSerif hota hai)
+        candidates += (
+            ["LiberationSerif-Bold.ttf", "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"]
+            if bold else
+            ["LiberationSerif-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"]
+        )
+    for cand in candidates:
         try:
-            return ImageFont.load_default(size=size)
+            return ImageFont.truetype(cand, size)
         except Exception:
-            return ImageFont.load_default()
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
 
 
 def extract_aadhaar_number(text):
@@ -458,7 +468,7 @@ def trim_right_by_column_gap(img, max_gap_px, bg_threshold=235):
     return img.crop((0, 0, last_ink + 1, img.height))
 
 
-def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
+def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True, meta_out=None):
     """
     Auto-detect crop (fixed coordinates nahi):
       - LEFT   : photo ke right edge ke baad se
@@ -497,6 +507,8 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
                 trim_to = max(1, red_row - RED_LINE_MARGIN_PX)
                 img = img.crop((0, 0, img.width, trim_to))
 
+            limit_pt = generous_bbox[1] + img.height * 72.0 / FRONT_INFO_CROP_RESOLUTION  # red line ke upar ki limit
+
             # 2) Right: bade khaali gap par ruk jao (side ke dusre block se bachne ke liye)
             gap_px = int(FRONT_INFO_MAX_GAP_PT * FRONT_INFO_CROP_RESOLUTION / 72)
             img = trim_right_by_column_gap(img, gap_px)
@@ -511,6 +523,43 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
             r = min(img.width, bbox[2] + pad)
             b = min(img.height, bbox[3] + pad)
             img = img.crop((l, t, r, b))
+
+            # 4) Lines ka asli font size + line pitch PDF se (Mobile line same size/gap me
+            #    draw karne ke liye). Baseline = chars ke text-matrix se.
+            if meta_out is not None:
+                try:
+                    px_per_pt = FRONT_INFO_CROP_RESOLUTION / 72.0
+                    sub = page.crop(generous_bbox)
+                    groups = []
+                    cand = [ch for ch in sub.chars
+                            if ch.get("text", "").strip() and ch["text"].isascii()
+                            and page.height - ch["matrix"][5] <= limit_pt]
+                    if cand:
+                        # Side ka chhota (vertical "Aadhaar No. Issued") text ignore: sirf asli line-size wale chars
+                        max_sz = max(ch["size"] for ch in cand)
+                        cand = [ch for ch in cand if ch["size"] >= 0.7 * max_sz]
+                    for ch in cand:
+                        base = page.height - ch["matrix"][5]
+                        for g in groups:
+                            if abs(g["base"] - base) <= 2.0:
+                                g["sizes"].append(ch["size"])
+                                break
+                        else:
+                            groups.append({"base": base, "sizes": [ch["size"]]})
+                    groups.sort(key=lambda g: g["base"])
+                    if len(groups) >= 2:
+                        bases = [g["base"] for g in groups]
+                        pitches = sorted(bases[i + 1] - bases[i] for i in range(len(bases) - 1))
+                        pitch_pt = pitches[len(pitches) // 2]
+                        sizes = sorted(sz for g in groups for sz in g["sizes"])
+                        size_pt = sizes[len(sizes) // 2]
+                        meta_out.update({
+                            "font_px": size_pt * px_per_pt,
+                            "pitch_px": pitch_pt * px_per_pt,
+                            "last_baseline_px": (bases[-1] - generous_bbox[1]) * px_per_pt - t,
+                        })
+                except Exception:
+                    pass
 
             return make_white_transparent(img)
     except Exception:
@@ -909,12 +958,15 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     has_hindi = data["hindi_name"] != "N/A"
 
     info_box = scale_box(FRONT_INFO_BOX)
-    info_crop = crop_front_info_block(pdf_bytes, password, has_hindi_name=has_hindi)
+    info_meta = {}
+    info_fit_scale = None
+    info_crop = crop_front_info_block(pdf_bytes, password, has_hindi_name=has_hindi, meta_out=info_meta)
 
     if info_crop is not None:
         box_w = info_box[2] - info_box[0]
         box_h = info_box[3] - info_box[1]
         fitted_info = contain_fit(info_crop, box_w, box_h)
+        info_fit_scale = fitted_info.width / info_crop.width
         template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
     else:
         y = info_box[1]
@@ -930,13 +982,23 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
         draw_mixed_line(draw, (info_box[0], y, info_box[2], y + row_h), [(gender_hi + "/ ", "hi"), (data["gender"], "en")], 34)
 
     if print_mobile and data["mobile_number"] != "N/A":
-        mobile_box = scale_box(MOBILE_BOX)
-        mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
-        draw_mixed_line(
-            draw, mobile_box,
-            [("Mobile No: ", "en"), (data["mobile_number"], "en")],
-            mobile_font_size
-        )
+        mobile_text = f"Mobile No: {data['mobile_number']}"
+        if info_fit_scale is not None and info_meta.get("font_px"):
+            # Name/DOB/Gender wali lines jaisa hi font size aur wahi line-gap
+            font_px = max(8, int(round(info_meta["font_px"] * info_fit_scale)))
+            baseline_y = info_box[1] + int(round(
+                (info_meta["last_baseline_px"] + info_meta["pitch_px"]) * info_fit_scale))
+            text_x = info_box[0] + int(round(FRONT_INFO_INK_PAD_PX * info_fit_scale))  # crop padding ke baad, baaki lines ke left se aligned
+            draw.text((text_x, baseline_y), mobile_text,
+                      font=get_font("en", False, font_px), fill="black", anchor="ls")
+        else:
+            mobile_box = scale_box(MOBILE_BOX)
+            mobile_font_size = int(MOBILE_FONT_SIZE * scale_y)
+            draw_mixed_line(
+                draw, mobile_box,
+                [("Mobile No: ", "en"), (data["mobile_number"], "en")],
+                mobile_font_size
+            )
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     draw_centered_text(
