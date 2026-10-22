@@ -57,6 +57,7 @@ FRONT_INFO_TOP_ABOVE_PHOTO_PT = 0  # photo ke top se kitna upar se scan shuru ka
 FRONT_MOBILE_BOTTOM_LIMIT = 378    # Mobile line ka neeche ka kinara isse neeche na jaye (template px, red box ke upar)
 FRONT_MOBILE_DESCENT_RATIO = 0.25  # baseline ke neeche descender ke liye font size ka hissa
 FRONT_INFO_MAX_FONT_PX = 31         # label (name/DOB/gender) ka max font size, card px me
+MOBILE_SIZE_BOOST = 1.04           # Mobile ka size label (measured) se itna zyada: thoda sa bada
 FRONT_INFO_SHRINK = 0.95           # Mobile ke saath poora block thoda chhota (size + gap)
 FRONT_INFO_MAX_GAP_PT = 14         # text columns ke beech is se bada gap = block khatam
 FRONT_INFO_INK_PAD_PX = 4          # tight text crop ke charon taraf padding
@@ -1269,6 +1270,72 @@ def paste_number_image(template, img, box, font, sample="0123456789"):
     template.paste(fitted, (px, py), fitted)
 
 
+def measure_pasted_block(block_rgba):
+    """
+    Template par paste hone wale name/DOB/gender block ko measure karta hai (pixels se):
+      - har line ka baseline (English/digits wali aakhri word se; Devanagari lines skip)
+      - line pitch (baseline-to-baseline) aur last baseline
+      - caps ki height -> usse font size (jis font se Mobile draw hoga wahi font)
+      - left_px: block ka left ink edge
+    Return dict ya None.
+    """
+    try:
+        alpha = np.array(block_rgba.split()[-1]) > 110
+        h, w = alpha.shape
+        lines = _bands(alpha.any(axis=1), 1)
+        lines = [bd for bd in lines if (bd[1] - bd[0] + 1) >= 4]
+        if len(lines) < 2:
+            return None
+        left_px = int(np.where(alpha.any(axis=0))[0][0])
+
+        info = []   # (line_index, baseline, top)
+        for li, (a, b) in enumerate(lines):
+            sub = alpha[a:b + 1, :]
+            bh = b - a + 1
+            words = _bands(sub.any(axis=0), max(3, int(0.18 * bh)))
+            if not words:
+                continue
+            c0, c1 = words[-1]
+            if c1 - c0 + 1 < 6:
+                continue
+            cl = sub[:, c0:c1 + 1]
+            rows = cl.sum(axis=1)
+            mx = rows.max()
+            if mx <= 0:
+                continue
+            if mx >= 0.85 * (c1 - c0 + 1):       # lambi shirorekha = Devanagari word -> skip
+                continue
+            idx = np.where(rows >= 0.3 * mx)[0]
+            top_idx = np.where(rows >= 0.12 * mx)[0]
+            info.append((li, a + int(idx[-1]), a + int(top_idx[0])))
+        if len(info) < 1:
+            return None
+
+        # pitch: Latin lines ke baselines se (index gap ka dhyan rakhte hue)
+        if len(info) >= 2:
+            pitches = sorted((info[j][1] - info[i][1]) / float(info[j][0] - info[i][0])
+                             for i in range(len(info)) for j in range(i + 1, len(info)))
+            pitch = pitches[len(pitches) // 2]
+        else:
+            return None
+        last_li, last_base, last_top = info[-1]
+        last_baseline = last_base + (len(lines) - 1 - last_li) * pitch
+
+        # caps ki height: sabse neeche wali Latin line (gender: MALE/FEMALE) se
+        cap_h = max(1, last_base - last_top + 1)
+        best, best_err = 12, 1e9
+        for size in range(8, 160):
+            f = get_font("en", False, size)
+            bb = f.getbbox("E")
+            err = abs((bb[3] - bb[1]) - cap_h)
+            if err < best_err:
+                best, best_err = size, err
+        return {"font_px": float(best), "pitch_px": float(pitch),
+                "last_baseline_px": float(last_baseline), "left_px": left_px, "cap_h": cap_h}
+    except Exception:
+        return None
+
+
 # ============================================================
 # DATA EXTRACTION
 # ============================================================
@@ -1416,6 +1483,7 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     info_box = scale_box(FRONT_INFO_BOX)
     info_meta = {}
     info_fit_scale = None
+    measured = None
     info_crop = crop_front_info_block(pdf_bytes, password, has_hindi_name=has_hindi, meta_out=info_meta)
 
     if info_crop is not None and not info_meta.get("font_px"):
@@ -1444,6 +1512,20 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
             new_h = max(1, int(info_crop.height * s_fit))
             fitted_info = info_crop.resize((new_w, new_h), Image.LANCZOS)
         info_fit_scale = fitted_info.width / info_crop.width
+
+        # Paste se pehle block ko measure karo (asli pixels): line pitch, caps ki height, font size.
+        # Mobile isi measured size/gap par aayega. Agar Mobile red box tak jaye to block thoda chhota.
+        measured = measure_pasted_block(fitted_info)
+        if measured:
+            limit_h = int(FRONT_MOBILE_BOTTOM_LIMIT * scale_y) - info_box[1]
+            need = (measured["last_baseline_px"] + measured["pitch_px"]
+                    + FRONT_MOBILE_DESCENT_RATIO * measured["font_px"] * MOBILE_SIZE_BOOST)
+            if need > limit_h:
+                k2 = limit_h / need
+                fitted_info = fitted_info.resize(
+                    (max(1, int(fitted_info.width * k2)), max(1, int(fitted_info.height * k2))), Image.LANCZOS)
+                info_fit_scale = fitted_info.width / info_crop.width
+                measured = measure_pasted_block(fitted_info)
         template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
     else:
         y = info_box[1]
@@ -1460,9 +1542,16 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
 
     mobile_img = img_fields.get("mobile_img")
     if print_mobile and (data["mobile_number"] != "N/A" or mobile_img is not None):
-        if info_fit_scale is not None and info_meta.get("font_px"):
-            # Name/DOB/Gender wali lines jaisa hi font size aur wahi line-gap
-            font_px = max(8, int(round(info_meta["font_px"] * info_fit_scale)))
+        if info_fit_scale is not None and measured:
+            # Paste hue name/DOB/gender block se measure kiya size + gap: Mobile wahi size (thoda sa bada)
+            # aur wahi line-gap, left edge bhi block ke saath aligned
+            font_px = max(8, int(round(measured["font_px"] * MOBILE_SIZE_BOOST)))
+            baseline_y = info_box[1] + int(round(measured["last_baseline_px"] + measured["pitch_px"]))
+            text_x = info_box[0] + measured["left_px"]
+            mfont = get_font("en", False, font_px)
+        elif info_fit_scale is not None and info_meta.get("font_px"):
+            # Measure na ho paye to PDF/image metrics se: wahi size aur gap
+            font_px = max(8, int(round(info_meta["font_px"] * info_fit_scale * MOBILE_SIZE_BOOST)))
             baseline_y = info_box[1] + int(round(
                 (info_meta["last_baseline_px"] + info_meta["pitch_px"]) * info_fit_scale))
             text_x = info_box[0] + int(round(FRONT_INFO_INK_PAD_PX * info_fit_scale))  # crop padding ke baad, baaki lines ke left se aligned
