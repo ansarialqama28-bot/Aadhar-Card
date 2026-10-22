@@ -4,6 +4,7 @@ import io
 import numpy as np
 import pdfplumber
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_raw
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
@@ -51,6 +52,10 @@ FRONT_INFO_CROP_RIGHT_EXTRA_NO_HINDI = 10
 FRONT_INFO_CROP_BOTTOM_MAX = 700
 FRONT_INFO_CROP_RESOLUTION = 500
 RED_LINE_MARGIN_PX = 8
+FRONT_INFO_PHOTO_GAP_PT = 3        # photo ke right edge ke baad itna gap chhod ke crop shuru
+FRONT_INFO_TOP_ABOVE_PHOTO_PT = 0  # photo ke top se kitna upar se scan shuru kare
+FRONT_INFO_MAX_GAP_PT = 14         # text columns ke beech is se bada gap = block khatam
+FRONT_INFO_INK_PAD_PX = 4          # tight text crop ke charon taraf padding
 
 # ============================================================
 # CONFIG — BACK CARD (Aadhaar)
@@ -73,11 +78,20 @@ BACK_ADDRESS_LINE_GAP = 6
 
 ADDR_CROP_PDF_BBOX = (321, 602, 460, 690)
 ADDR_CROP_RESOLUTION = 500
+ADDR_MIN_X_PT = 250          # 'Address:' label is x se right me hi maana jayega (address column)
+ADDR_MAX_LINE_GAP_PT = 22    # lines ke beech is se bada gap = block khatam
+ADDR_CROP_PAD_PT = 2         # detected text bbox ke charon taraf padding
 
 # QR code — real, PDF se seedha crop hoke aata hai (regenerate nahi
 # hota, kyunki uske andar UIDAI ka digitally-signed data hota hai)
 QR_CROP_PDF_BBOX = (461.4, 601.6, 558.5, 696.5)
 QR_CROP_RESOLUTION = 600
+QR_MIN_RATIO, QR_MAX_RATIO = 0.9, 1.1   # square image = QR
+QR_OUTPUT_MIN_PX = 800                  # QR output kam se kam itne px ka
+QR_QUIET_ZONE_RATIO = 0.05              # QR ke charon taraf white margin
+QR_MIN_DENSITY = 0.25                   # QR rows/cols me kam se kam itni ink density
+QR_BAND_TOL_PT = 80                     # photo ke top se itna upar/neeche tak same card-band maane
+QR_MIN_SIZE_PT = 50                     # isse chhoti square images (logo/icon) ignore
 
 BACK_QR_BOX = (700, 180, 985, 460)
 
@@ -276,23 +290,200 @@ def crop_pdf_region(pdf_bytes, password, bbox, resolution):
         return None
 
 
+def _group_words_into_lines(words, tol=3.0):
+    """Words ko unke 'top' ke hisaab se lines me group karta hai (upar se neeche)."""
+    lines = []
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        if lines and abs(lines[-1]["top"] - w["top"]) <= tol:
+            ln = lines[-1]
+            ln["words"].append(w)
+            ln["top"] = min(ln["top"], w["top"])
+            ln["bottom"] = max(ln["bottom"], w["bottom"])
+        else:
+            lines.append({"top": w["top"], "bottom": w["bottom"], "words": [w]})
+    for ln in lines:
+        ln["text"] = " ".join(w["text"] for w in sorted(ln["words"], key=lambda w: w["x0"]))
+        ln["x0"] = min(w["x0"] for w in ln["words"])
+        ln["x1"] = max(w["x1"] for w in ln["words"])
+    return lines
+
+
+def detect_address_bbox(page):
+    """
+    Back card ka address block (Hindi + English) text detect karke dhoondhta hai.
+      - Right limit : QR ka left edge
+      - English start: "Address:" label
+      - Hindi start  : us label ke upar ki contiguous Devanagari/text lines
+      - End          : English address ki woh line jisme 6-digit PIN ho
+    Return (x0, top, x1, bottom) PDF points me, ya None.
+    """
+    qr_bbox = find_qr_bbox_from_images(page) or QR_CROP_PDF_BBOX
+    qr_left, qr_top = qr_bbox[0], qr_bbox[1]
+    right_limit = qr_left - 2
+
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+    words = [w for w in words if w["x1"] <= right_limit + 1]
+
+    labels = [w for w in words
+              if w["text"].lower().startswith("address") and w["x0"] >= ADDR_MIN_X_PT]
+    if not labels:
+        return None
+    # QR ke sabse paas (vertically) wala "Address:" label
+    label = min(labels, key=lambda w: abs(w["top"] - qr_top))
+    col_left = label["x0"] - 1
+
+    col_words = [w for w in words if w["x0"] >= col_left - 1 and w["x1"] <= right_limit + 1]
+    lines = _group_words_into_lines(col_words)
+
+    idx = next((i for i, ln in enumerate(lines) if abs(ln["top"] - label["top"]) <= 3), None)
+    if idx is None:
+        return None
+
+    # neeche: PIN wali line tak (English end)
+    end_idx = idx
+    for j in range(idx, len(lines)):
+        if j > idx and lines[j]["top"] - lines[j - 1]["bottom"] > ADDR_MAX_LINE_GAP_PT:
+            break
+        end_idx = j
+        if re.search(r"\b\d{6}\b", lines[j]["text"]):
+            break
+
+    # upar: Hindi block tak (contiguous lines)
+    start_idx = idx
+    for j in range(idx - 1, -1, -1):
+        if lines[j + 1]["top"] - lines[j]["bottom"] > ADDR_MAX_LINE_GAP_PT:
+            break
+        start_idx = j
+
+    block = lines[start_idx:end_idx + 1]
+    x0 = min(ln["x0"] for ln in block)
+    x1 = min(max(ln["x1"] for ln in block), right_limit)
+    top = block[0]["top"]
+    bottom = block[-1]["bottom"]
+    if x1 <= x0 or bottom <= top:
+        return None
+    return (x0, top, x1, bottom)
+
+
 def crop_combined_address_block(pdf_bytes, password=None):
-    return crop_pdf_region(pdf_bytes, password, ADDR_CROP_PDF_BBOX, ADDR_CROP_RESOLUTION)
-
-
-def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
-    right = FRONT_INFO_CROP_RIGHT_BASE + FRONT_INFO_CROP_RIGHT_EXTRA_DEFAULT
-    if not has_hindi_name:
-        right += FRONT_INFO_CROP_RIGHT_EXTRA_NO_HINDI
-
+    """
+    Hindi + English address ko text-detect karke crop karta hai
+    (fixed coordinates nahi). Detect fail ho to purane fixed bbox ko
+    search-area maan kar usme se ink-tight crop leta hai.
+    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
+
+            bbox = None
+            try:
+                bbox = detect_address_bbox(page)
+            except Exception:
+                bbox = None
+
+            if bbox is not None:
+                p = ADDR_CROP_PAD_PT
+                bbox = (bbox[0] - p, bbox[1] - p, bbox[2] + p, bbox[3] + p)
+            else:
+                bbox = ADDR_CROP_PDF_BBOX
+
+            safe_bbox = (
+                max(0, bbox[0]), max(0, bbox[1]),
+                min(page.width, bbox[2]), min(page.height, bbox[3])
+            )
+            if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
+                return None
+
+            img = page.crop(safe_bbox).to_image(resolution=ADDR_CROP_RESOLUTION).original.convert("RGB")
+
+            ink = find_ink_bbox(img)
+            if ink is not None:
+                pad = FRONT_INFO_INK_PAD_PX
+                img = img.crop((max(0, ink[0] - pad), max(0, ink[1] - pad),
+                                min(img.width, ink[2] + pad), min(img.height, ink[3] + pad)))
+            return make_white_transparent(img)
+    except Exception:
+        return None
+
+
+def get_face_photo_bbox(page):
+    """PDF page par chehre wali photo ka bbox (x0, top, x1, bottom) deta hai."""
+    candidates = []
+    for im in page.images:
+        w = im["x1"] - im["x0"]
+        h = im["bottom"] - im["top"]
+        if h <= 0 or w <= 0:
+            continue
+        ratio = w / h
+        if 0.55 <= ratio <= 0.95 and 15 <= w <= 260 and 15 <= h <= 320:
+            candidates.append((im, w * h))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[1])
+    im = candidates[0][0]
+    return (im["x0"], im["top"], im["x1"], im["bottom"])
+
+
+def find_ink_bbox(img, bg_threshold=235):
+    """Image me non-white (text) pixels ka tight bounding box: (l, t, r, b)."""
+    arr = np.array(img.convert("RGB"))
+    ink = (arr < bg_threshold).any(axis=2)
+    rows = np.where(ink.any(axis=1))[0]
+    cols = np.where(ink.any(axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return None
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
+def trim_right_by_column_gap(img, max_gap_px, bg_threshold=235):
+    """
+    Left se start karke text ke columns follow karta hai; jaise hi
+    max_gap_px se bada khaali gap mile, wahin right side kaat deta hai
+    (taaki side ka koi aur block crop me na aa jaye).
+    """
+    arr = np.array(img.convert("RGB"))
+    ink_cols = (arr < bg_threshold).any(axis=2).any(axis=0)
+    last_ink = None
+    gap = 0
+    for x, has_ink in enumerate(ink_cols):
+        if has_ink:
+            last_ink = x
+            gap = 0
+        elif last_ink is not None:
+            gap += 1
+            if gap > max_gap_px:
+                break
+    if last_ink is None:
+        return img
+    return img.crop((0, 0, last_ink + 1, img.height))
+
+
+def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
+    """
+    Auto-detect crop (fixed coordinates nahi):
+      - LEFT   : photo ke right edge ke baad se
+      - BOTTOM : red line ke upar tak
+      - TOP/RIGHT/LEFT-tight : text ke asli pixels detect karke tight crop
+    Photo na mile to purane fixed values fallback me use hote hain.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
+            page = pdf.pages[0]
+
+            photo_bbox = get_face_photo_bbox(page)
+            if photo_bbox is not None:
+                left = photo_bbox[2] + FRONT_INFO_PHOTO_GAP_PT
+                top = max(0, photo_bbox[1] - FRONT_INFO_TOP_ABOVE_PHOTO_PT)
+            else:
+                left = FRONT_INFO_CROP_LEFT
+                top = FRONT_INFO_CROP_TOP
+
+            right = ADDR_CROP_PDF_BBOX[0] - 2
             generous_bbox = (
-                max(0, FRONT_INFO_CROP_LEFT),
-                max(0, FRONT_INFO_CROP_TOP),
+                max(0, left),
+                max(0, top),
                 min(page.width, right),
-                min(page.height, FRONT_INFO_CROP_BOTTOM_MAX)
+                min(page.height, FRONT_INFO_CROP_BOTTOM_MAX),
             )
             if generous_bbox[2] <= generous_bbox[0] or generous_bbox[3] <= generous_bbox[1]:
                 return None
@@ -300,21 +491,162 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True):
             cropped = page.crop(generous_bbox).to_image(resolution=FRONT_INFO_CROP_RESOLUTION)
             img = cropped.original.convert("RGB")
 
+            # 1) Neeche se: red line ke upar tak
             red_row = detect_red_line_row(img)
             if red_row is not None:
                 trim_to = max(1, red_row - RED_LINE_MARGIN_PX)
                 img = img.crop((0, 0, img.width, trim_to))
+
+            # 2) Right: bade khaali gap par ruk jao (side ke dusre block se bachne ke liye)
+            gap_px = int(FRONT_INFO_MAX_GAP_PT * FRONT_INFO_CROP_RESOLUTION / 72)
+            img = trim_right_by_column_gap(img, gap_px)
+
+            # 3) Text ke asli pixels par tight crop (top/left/right/bottom)
+            bbox = find_ink_bbox(img)
+            if bbox is None:
+                return None
+            pad = FRONT_INFO_INK_PAD_PX
+            l = max(0, bbox[0] - pad)
+            t = max(0, bbox[1] - pad)
+            r = min(img.width, bbox[2] + pad)
+            b = min(img.height, bbox[3] + pad)
+            img = img.crop((l, t, r, b))
 
             return make_white_transparent(img)
     except Exception:
         return None
 
 
+def find_qr_bbox_from_images(page):
+    """
+    PDF ke embedded images me se square wali (QR) image dhoondhta hai.
+    Photo (portrait ratio) aur chhote logos ignore hote hain.
+
+    Page par ek se zyada QR-jaisi square images ho sakti hain (jaise upar
+    letter wala QR), isliye card wali band ka QR chunte hain:
+      - photo mile to: jo square image photo ki hi vertical band me ho
+      - warna: page me sabse neeche wali square image
+    Return: (x0, top, x1, bottom) ya None.
+    """
+    candidates = []
+    for im in page.images:
+        w = im["x1"] - im["x0"]
+        h = im["bottom"] - im["top"]
+        if w <= 0 or h <= 0:
+            continue
+        ratio = w / h
+        if QR_MIN_RATIO <= ratio <= QR_MAX_RATIO and w >= QR_MIN_SIZE_PT and h >= QR_MIN_SIZE_PT:
+            candidates.append(im)
+    if not candidates:
+        return None
+
+    photo = get_face_photo_bbox(page)
+    if photo is not None:
+        same_band = [im for im in candidates if abs(im["top"] - photo[1]) <= QR_BAND_TOL_PT]
+        if same_band:
+            candidates = same_band
+
+    # photo ke saath same band me bhi kai ho to sabse right wali (QR card ke right side me hota hai)
+    im = max(candidates, key=lambda c: (c["top"], c["x0"]))
+    if photo is not None:
+        im = max(candidates, key=lambda c: c["x0"])
+    return (im["x0"], im["top"], im["x1"], im["bottom"])
+
+
+def squarify_ink(img, bg_threshold=200, quiet_ratio=0.04):
+    """
+    Image me dark pixels (QR modules) ka tight bbox nikaal kar, usko
+    perfect square banata hai (quiet-zone padding ke saath). Bahar ka
+    koi text/line crop me nahi aata kyunki sirf ink-bbox ke andar ka
+    square liya jata hai.
+    """
+    arr = np.array(img.convert("L"))
+    ink = arr < bg_threshold
+    # QR dense hota hai; aas-paas ke chhote text/lines sparse. Isliye sirf wahi
+    # rows/columns lete hain jinme ink ki density kaafi ho.
+    row_density = ink.sum(axis=1) / ink.shape[1]
+    col_density = ink.sum(axis=0) / ink.shape[0]
+    rows = np.where(row_density >= QR_MIN_DENSITY)[0]
+    cols = np.where(col_density >= QR_MIN_DENSITY)[0]
+    if rows.size == 0 or cols.size == 0:
+        return img
+    l, r = int(cols[0]), int(cols[-1]) + 1
+    t, b = int(rows[0]), int(rows[-1]) + 1
+    side = max(r - l, b - t)
+    pad = int(side * quiet_ratio)
+    side += 2 * pad
+    cx, cy = (l + r) // 2, (t + b) // 2
+    x0, y0 = cx - side // 2, cy - side // 2
+    canvas = Image.new("RGB", (side, side), "white")
+    src_box = (max(0, x0), max(0, y0), min(img.width, x0 + side), min(img.height, y0 + side))
+    piece = img.convert("RGB").crop(src_box)
+    canvas.paste(piece, (src_box[0] - x0, src_box[1] - y0))
+
+    # Quiet-zone me aas-paas ke text/lines ke stray marks aa gaye hon to saaf kar do:
+    # QR ke dense area ke bahar sab kuch white.
+    clean = Image.new("RGB", canvas.size, "white")
+    qr_box = (l - x0, t - y0, r - x0, b - y0)
+    clean.paste(canvas.crop(qr_box), (qr_box[0], qr_box[1]))
+    return clean
+
+
+def extract_qr_via_pdfium(pdf_bytes, password, bbox):
+    """
+    QR ki asli embedded image ko seedha PDF se nikaalta hai (page render
+    nahi) — isse aas-paas ka koi text/line QR ke saath nahi aata, aur
+    QR ke modules bilkul original rehte hain (scan hota rahega).
+    bbox: pdfplumber coords (x0, top, x1, bottom).
+    """
+    pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes), password=password or None)
+    try:
+        page = pdf[0]
+        page_h = page.get_height()
+        best = None
+        for obj in page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]):
+            l, b, r, t = obj.get_bounds()
+            top = page_h - t
+            dist = abs(l - bbox[0]) + abs(top - bbox[1]) + abs(r - bbox[2]) + abs((page_h - b) - bbox[3])
+            if best is None or dist < best[0]:
+                best = (dist, obj)
+        if best is None or best[0] > 8:
+            return None
+        img = best[1].get_bitmap().to_pil().convert("RGB")
+    finally:
+        pdf.close()
+
+    # Sharp modules ke liye NEAREST se bada karo + chaaron taraf white quiet zone
+    scale = max(1, QR_OUTPUT_MIN_PX // max(img.width, img.height))
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    side = max(img.width, img.height)
+    qz = int(side * QR_QUIET_ZONE_RATIO)
+    canvas = Image.new("RGB", (img.width + 2 * qz, img.height + 2 * qz), "white")
+    canvas.paste(img, (qz, qz))
+    return canvas
+
+
 def crop_real_qr_image(pdf_bytes, password=None):
+    """
+    QR ko auto-detect karke sirf QR deta hai (real QR, regenerate nahi —
+    kyunki usme UIDAI ka signed data hota hai).
+      1) PDF me square image dhoondo, aur wahi image seedha extract karo
+      2) Na ho paye to us jagah ko render karke dense-QR area se square crop
+    """
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or "") as pdf:
             page = pdf.pages[0]
-            bbox = QR_CROP_PDF_BBOX
+
+            bbox = find_qr_bbox_from_images(page)
+            if bbox is not None:
+                try:
+                    qr = extract_qr_via_pdfium(pdf_bytes, password, bbox)
+                    if qr is not None:
+                        return qr
+                except Exception:
+                    pass
+            else:
+                bbox = QR_CROP_PDF_BBOX  # fallback search area
+
             safe_bbox = (
                 max(0, bbox[0]), max(0, bbox[1]),
                 min(page.width, bbox[2]), min(page.height, bbox[3])
@@ -322,7 +654,8 @@ def crop_real_qr_image(pdf_bytes, password=None):
             if safe_bbox[2] <= safe_bbox[0] or safe_bbox[3] <= safe_bbox[1]:
                 return None
             cropped = page.crop(safe_bbox).to_image(resolution=QR_CROP_RESOLUTION)
-            return cropped.original.convert("RGB")
+            img = cropped.original.convert("RGB")
+            return squarify_ink(img)
     except Exception:
         return None
 
@@ -679,7 +1012,7 @@ def build_back_card_image(pdf_bytes, password=None):
     if qr_crop is not None:
         qr_box_w = qr_box[2] - qr_box[0]
         qr_box_h = qr_box[3] - qr_box[1]
-        fitted_qr = cover_fit(qr_crop, qr_box_w, qr_box_h)
+        fitted_qr = contain_fit(qr_crop, qr_box_w, qr_box_h)
         template.paste(fitted_qr, (qr_box[0], qr_box[1]))
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
