@@ -570,6 +570,38 @@ def crop_front_info_block(pdf_bytes, password=None, has_hindi_name=True, meta_ou
         return None
 
 
+def estimate_info_meta_from_image(info_crop):
+    """
+    PDF se font metrics na mile to label ki image se hi line-pitch aur font size
+    estimate karta hai (text ke row-bands se). Mobile ka size phir bhi label ke
+    size ke saath auto-adjust hota hai, kabhi fixed nahi.
+    """
+    try:
+        alpha = np.array(info_crop.split()[-1]) > 40
+        rows = np.where(alpha.any(axis=1))[0]
+        if rows.size == 0:
+            return {}
+        bands, start, prev = [], rows[0], rows[0]
+        for r in rows[1:]:
+            if r - prev > 2:
+                bands.append((start, prev))
+                start = r
+            prev = r
+        bands.append((start, prev))
+        if len(bands) < 2:
+            return {}
+        centers = [(a + b) / 2.0 for a, b in bands]
+        diffs = sorted(centers[i + 1] - centers[i] for i in range(len(centers) - 1))
+        band_pitch = diffs[len(diffs) // 2]
+        # Hindi glyphs bands ko thoda lamba dikhate hain; standard Aadhaar layout par calibrated:
+        pitch = band_pitch * 0.918                      # asli baseline-to-baseline gap
+        font_px = band_pitch * 0.579                    # asli font size (em)
+        last_baseline = bands[-1][1] - 0.138 * band_pitch   # last band ka neeche ka kinara -> baseline
+        return {"font_px": float(font_px), "pitch_px": float(pitch), "last_baseline_px": float(last_baseline)}
+    except Exception:
+        return {}
+
+
 def find_qr_bbox_from_images(page):
     """
     PDF ke embedded images me se square wali (QR) image dhoondhta hai.
@@ -965,6 +997,9 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     info_meta = {}
     info_fit_scale = None
     info_crop = crop_front_info_block(pdf_bytes, password, has_hindi_name=has_hindi, meta_out=info_meta)
+
+    if info_crop is not None and not info_meta.get("font_px"):
+        info_meta = estimate_info_meta_from_image(info_crop)
 
     if info_crop is not None:
         box_w = info_box[2] - info_box[0]
