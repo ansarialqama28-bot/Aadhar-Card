@@ -124,6 +124,8 @@ PRINT_CARD_GAP_PX = 35          # front (left) aur back (right) card ke beech ga
 PRINT_CARD_W_PX = (2 * _CR80_W_PX + 70 - PRINT_CARD_GAP_PX) // 2
 PRINT_CARD_H_PX = int(round(PRINT_CARD_W_PX * CARD_HEIGHT_MM / CARD_WIDTH_MM))
 PRINT_TOP_MARGIN_PX = 120       # A4 ke upar se margin (~10mm)
+PRINT_BORDER_PX = 2             # A4 me har card ke chaaron kinare ka border (card ke andar, size nahi badhta)
+PRINT_BORDER_COLOR = "black"
 
 FONT_EN_REGULAR = "times.ttf"
 FONT_EN_BOLD = "timesbd.ttf"
@@ -1737,6 +1739,11 @@ def build_print_pdf_page(front_img, back_img):
 
     a4.paste(front, (x_front, y))
     a4.paste(back, (x_back, y))
+
+    # Dono cards ke chaaron kinare 2px ka border
+    draw = ImageDraw.Draw(a4)
+    for x0 in (x_front, x_back):
+        draw.rectangle([x0, y, x0 + cw - 1, y + ch - 1], outline=PRINT_BORDER_COLOR, width=PRINT_BORDER_PX)
 
     return a4
 
