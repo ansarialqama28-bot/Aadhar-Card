@@ -54,6 +54,10 @@ FRONT_INFO_CROP_RESOLUTION = 500
 RED_LINE_MARGIN_PX = 8
 FRONT_INFO_PHOTO_GAP_PT = 3        # photo ke right edge ke baad itna gap chhod ke crop shuru
 FRONT_INFO_TOP_ABOVE_PHOTO_PT = 0  # photo ke top se kitna upar se scan shuru kare
+FRONT_MOBILE_BOTTOM_LIMIT = 378    # Mobile line ka neeche ka kinara isse neeche na jaye (template px, red box ke upar)
+FRONT_MOBILE_DESCENT_RATIO = 0.25  # baseline ke neeche descender ke liye font size ka hissa
+FRONT_INFO_MAX_FONT_PX = 31         # label (name/DOB/gender) ka max font size, card px me
+FRONT_INFO_SHRINK = 0.95           # Mobile ke saath poora block thoda chhota (size + gap)
 FRONT_INFO_MAX_GAP_PT = 14         # text columns ke beech is se bada gap = block khatam
 FRONT_INFO_INK_PAD_PX = 4          # tight text crop ke charon taraf padding
 
@@ -966,6 +970,24 @@ def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
         box_w = info_box[2] - info_box[0]
         box_h = info_box[3] - info_box[1]
         fitted_info = contain_fit(info_crop, box_w, box_h)
+        if info_meta.get("font_px"):
+            # Hamesha (mobile print ho ya na ho) Mobile line ki jagah chhod ke fit karo:
+            #   1) width box me aaye
+            #   2) block + Mobile line red-border box ke upar rahe
+            #   3) label ka font FRONT_INFO_MAX_FONT_PX se bada na ho
+            # Size aur gap dono ek saath scale hote hain, isliye hamesha barabar rehte hain.
+            need_h = (info_meta["last_baseline_px"] + info_meta["pitch_px"]
+                      + FRONT_MOBILE_DESCENT_RATIO * info_meta["font_px"])
+            avail_h = int(FRONT_MOBILE_BOTTOM_LIMIT * scale_y) - info_box[1]
+            max_font_px = FRONT_INFO_MAX_FONT_PX * scale_y
+            s_fit = min(
+                box_w / info_crop.width,
+                avail_h / need_h,
+                max_font_px / info_meta["font_px"],
+            ) * FRONT_INFO_SHRINK
+            new_w = max(1, int(info_crop.width * s_fit))
+            new_h = max(1, int(info_crop.height * s_fit))
+            fitted_info = info_crop.resize((new_w, new_h), Image.LANCZOS)
         info_fit_scale = fitted_info.width / info_crop.width
         template.paste(fitted_info, (info_box[0], info_box[1]), fitted_info)
     else:
