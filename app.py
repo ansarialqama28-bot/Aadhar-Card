@@ -1459,7 +1459,7 @@ def _serialized(fn):
 def build_front_card_image(pdf_bytes, password=None, print_mobile=False):
     data = extract_front_data(pdf_bytes, password)
     if data["photo"] is None:
-        raise ValueError("PDF mein se chehre wali photo nahi mil payi")
+        raise ValueError("Could not find the face photo in this PDF. Please upload the original Aadhaar PDF downloaded from the UIDAI website.")
 
     img_fields = extract_image_fields(pdf_bytes, password) if data.get("image_mode") else {}
 
@@ -1749,6 +1749,46 @@ def build_print_pdf_page(front_img, back_img):
 
 
 # ============================================================
+# FRIENDLY ERRORS (hamesha English me)
+# ============================================================
+def describe_error(exc, what="card", has_password=False):
+    """Exception ko (English message, http status, technical detail) me badalta hai."""
+    name = type(exc).__name__
+    msg = str(exc) or ""
+    low = msg.lower()
+    inner = exc.args[0] if getattr(exc, "args", None) else None
+    inner_name = type(inner).__name__ if inner is not None else ""
+    detail = f"{name}: {msg}".strip(": ")
+
+    if (isinstance(exc, pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect)
+            or "password" in inner_name.lower() or "password" in low or "encrypt" in low):
+        if has_password:
+            return "The password is incorrect, or this PDF could not be unlocked. Please check the password and try again.", 400, detail
+        return "This PDF is password-protected. Please enter the correct password and try again.", 400, detail
+
+    if isinstance(exc, ValueError) and msg:
+        return msg, 400, detail
+
+    invalid_markers = ("no /root", "unexpected eof", "not a pdf", "data format error",
+                       "malformed", "pdfsyntax", "failed to load document", "is this really a pdf")
+    if any(m in low for m in invalid_markers):
+        return ("This file could not be read as a PDF. It may be damaged or incomplete. "
+                "Please upload the original Aadhaar PDF."), 400, detail
+
+    if isinstance(exc, IndexError) or "failed to load page" in low:
+        return ("This PDF has no readable page. Please upload the original Aadhaar PDF "
+                "downloaded from the UIDAI website."), 400, detail
+
+    return (f"Something went wrong while building the {what}. Please try again. If it keeps happening, "
+            "upload the original Aadhaar PDF downloaded from the UIDAI website."), 500, detail
+
+
+def error_response(exc, what, password):
+    message, status, detail = describe_error(exc, what, bool(password))
+    return jsonify({"error": message, "detail": detail}), status
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 @app.route("/generate-card", methods=["POST"])
@@ -1760,15 +1800,13 @@ def generate_card():
     print_mobile = request.form.get("print_mobile", "no").strip().lower() == "yes"
     pdf_file = request.files["pdf"]
     pdf_bytes = pdf_file.read()
+    if not pdf_bytes:
+        return jsonify({"error": "The uploaded file is empty. Please choose your Aadhaar PDF again."}), 400
 
     try:
         template = build_front_card_image(pdf_bytes, password, print_mobile)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
-        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
     except Exception as e:
-        return jsonify({"error": f"Could not generate the card: {str(e)}"}), 500
+        return error_response(e, "front card", password)
 
     output = io.BytesIO()
     template.save(output, format="PNG")
@@ -1784,13 +1822,13 @@ def generate_card_back():
     password = request.form.get("password", "").strip()
     pdf_file = request.files["pdf"]
     pdf_bytes = pdf_file.read()
+    if not pdf_bytes:
+        return jsonify({"error": "The uploaded file is empty. Please choose your Aadhaar PDF again."}), 400
 
     try:
         template = build_back_card_image(pdf_bytes, password)
-    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
-        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
     except Exception as e:
-        return jsonify({"error": f"Could not generate the back card: {str(e)}"}), 500
+        return error_response(e, "back card", password)
 
     output = io.BytesIO()
     template.save(output, format="PNG")
@@ -1807,17 +1845,15 @@ def generate_print_pdf():
     print_mobile = request.form.get("print_mobile", "no").strip().lower() == "yes"
     pdf_file = request.files["pdf"]
     pdf_bytes = pdf_file.read()
+    if not pdf_bytes:
+        return jsonify({"error": "The uploaded file is empty. Please choose your Aadhaar PDF again."}), 400
 
     try:
         front = build_front_card_image(pdf_bytes, password, print_mobile)
         back = build_back_card_image(pdf_bytes, password)
         page = build_print_pdf_page(front, back)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
-        return jsonify({"error": "Password galat hai ya PDF unlock nahi ho paayi"}), 400
     except Exception as e:
-        return jsonify({"error": f"Could not generate the print PDF: {str(e)}"}), 500
+        return error_response(e, "print PDF", password)
 
     output = io.BytesIO()
     page.save(output, format="PDF", resolution=float(A4_DPI))
