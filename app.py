@@ -108,7 +108,8 @@ QR_MIN_DENSITY = 0.25                   # QR rows/cols me kam se kam itni ink de
 QR_BAND_TOL_PT = 80                     # photo ke top se itna upar/neeche tak same card-band maane
 QR_MIN_SIZE_PT = 50                     # isse chhoti square images (logo/icon) ignore
 
-BACK_QR_BOX = (700, 180, 985, 460)
+BACK_QR_BOX = (698, 160, 1006, 468)   # bada QR: har card par same size (308x308)
+BACK_QR_QUIET = 0.035                 # QR ke charon taraf chhota white margin (ratio)
 
 # ============================================================
 # CONFIG — A4 PRINT LAYOUT
@@ -871,6 +872,25 @@ def extract_qr_via_pdfium(pdf_bytes, password, bbox):
     qz = int(side * QR_QUIET_ZONE_RATIO)
     canvas = Image.new("RGB", (img.width + 2 * qz, img.height + 2 * qz), "white")
     canvas.paste(img, (qz, qz))
+    return canvas
+
+
+def tight_qr_square(img):
+    """QR ke dark modules ka tight square (quiet-zone ke bina)."""
+    arr = np.array(img.convert("L"))
+    ink = arr < 128
+    rows = np.where(ink.sum(axis=1) / ink.shape[1] >= 0.15)[0]
+    cols = np.where(ink.sum(axis=0) / ink.shape[0] >= 0.15)[0]
+    if rows.size == 0 or cols.size == 0:
+        return img.convert("RGB")
+    l, r = int(cols[0]), int(cols[-1]) + 1
+    t, b = int(rows[0]), int(rows[-1]) + 1
+    side = max(r - l, b - t)
+    cx, cy = (l + r) // 2, (t + b) // 2
+    x0, y0 = cx - side // 2, cy - side // 2
+    canvas = Image.new("RGB", (side, side), "white")
+    box = (max(0, x0), max(0, y0), min(img.width, x0 + side), min(img.height, y0 + side))
+    canvas.paste(img.convert("RGB").crop(box), (box[0] - x0, box[1] - y0))
     return canvas
 
 
@@ -1691,8 +1711,16 @@ def build_back_card_image(pdf_bytes, password=None):
     if qr_crop is not None:
         qr_box_w = qr_box[2] - qr_box[0]
         qr_box_h = qr_box[3] - qr_box[1]
-        fitted_qr = contain_fit(qr_crop, qr_box_w, qr_box_h)
-        template.paste(fitted_qr, (qr_box[0], qr_box[1]))
+        # Har card par QR EXACT same size: quiet-zone hata ke modules tight crop,
+        # phir fixed margin ke saath fixed square me.
+        side_px = min(qr_box_w, qr_box_h)
+        tight = tight_qr_square(qr_crop)
+        inner = max(1, int(round(side_px * (1 - 2 * BACK_QR_QUIET))))
+        tight = tight.resize((inner, inner), Image.LANCZOS)
+        canvas_qr = Image.new("RGB", (side_px, side_px), "white")
+        off = (side_px - inner) // 2
+        canvas_qr.paste(tight, (off, off))
+        template.paste(canvas_qr, (qr_box[0] + (qr_box_w - side_px) // 2, qr_box[1] + (qr_box_h - side_px) // 2))
 
     aadhaar_box = scale_box(AADHAAR_NUM_BOX)
     if img_fields.get("aadhaar_img") is not None:
